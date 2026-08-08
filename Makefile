@@ -9,7 +9,7 @@ endif
 SAMPLING_TEST := tests/test_sampling
 
 DEBUG_FLAGS ?= -g
-CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+CFLAGS ?= -O3 -ffast-math -fPIC $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
@@ -56,7 +56,7 @@ HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+ROCM_LDLIBS ?= -lm -pthread -lamdhip64 -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
