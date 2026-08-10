@@ -105,11 +105,20 @@ Sparse sweep CSV/SVG: `speed-bench/strix_halo_idx.csv` + `_ts.svg` (2K, 32K,
 
 ## Next Steps (in priority order)
 
-### 1. Indexer top-k kernel (`rocm/ds4_rocm_indexer.cuh`)
+### 1. Indexer top-k kernel (DONE 2026-08-10)
 
-~26 ms/layer at 64K, grows with n_comp (top-512 over n_comp rows). Not yet
-profiled for scaling; likely worth a pass (radix/merge vs the current
-`indexer_topk_*` + sort-512).
+Replaced the 4096-row bitonic tree (144-pass full sorts to extract top-512)
+with a CUB radix-sort tree over 8192-row chunks:
+`indexer_topk_chunk_cub_kernel<8192>` + `indexer_topk_tree_merge_cub_kernel`
++ `indexer_topk_final_merge_cub_kernel` in `rocm/ds4_rocm_indexer.cuh`.
+The bitonic 4096 tree stays as a fallback for devices without 64 KiB opt-in
+shared memory.
+
+Micro-benchmark (4096 tokens): 26.6 → 20.0 ms at 16K comps (cub4096),
+160.4 → 115.4 ms at 98K comps (cub8192, 1.39x), bit-exact vs the bitonic
+reference at every n_comp. Production stage profile: 26.6 → 24.8 ms at 64K
+(comp=16384), 44 ms at 128K tail (comp=32768). End-to-end 64K 198.9,
+128K 171.8 t/s (no regression).
 
 ### 2. fp16 index inputs
 

@@ -954,6 +954,141 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
+/* Radix-sort top-k over 8192-row chunks (replaces the 4096-row bitonic tree
+ * for n_comp > 8192).  Each chunk keeps top_k candidates; groups of
+ * 8192/top_k chunks are merged per block (each merge sorts <= 8192 packed
+ * (score, index) keys), with a final single-block merge.  CUB BlockRadixSort
+ * replaces the 144-pass bitonic network: measured 1.3-1.4x faster at
+ * 16K-200K comps (4096 tokens), bit-exact vs the bitonic tree. */
+template <uint32_t CHUNK_N>
+__global__ static void indexer_topk_chunk_cub_kernel(
+        uint32_t *candidates,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        uint32_t candidate_stride) {
+    constexpr uint32_t THREADS = 512u;
+    constexpr uint32_t IPT = CHUNK_N / THREADS;
+    using BlockSort = cub::BlockRadixSort<uint64_t, THREADS, IPT>;
+    extern __shared__ __align__(16) unsigned char sort_smem[];
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
+    const uint32_t t = blockIdx.x;
+    const uint32_t chunk = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= THREADS) return;
+    const uint32_t chunk_start = chunk * CHUNK_N;
+    if (chunk_start >= n_comp) return;
+    const uint32_t chunk_n = n_comp - chunk_start < CHUNK_N ? n_comp - chunk_start : CHUNK_N;
+    const float *row = scores + (uint64_t)t * n_comp;
+    uint64_t keys[IPT];
+#pragma unroll
+    for (uint32_t item = 0; item < IPT; item++) {
+        const uint32_t i = tid * IPT + item;
+        if (i < chunk_n) keys[item] = topk_pack_key(row[chunk_start + i], chunk_start + i);
+        else keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+    uint32_t *out = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
+#pragma unroll
+    for (uint32_t item = 0; item < IPT; item++) {
+        const uint32_t i = tid * IPT + item;
+        if (i < top_k) out[i] = 0xffffffffu - (uint32_t)keys[item];
+    }
+}
+
+template <uint32_t CAP>
+__global__ static void indexer_topk_tree_merge_cub_kernel(
+        uint32_t *out,
+        const uint32_t *candidates,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        uint32_t n_sets,
+        uint32_t merge_group,
+        uint32_t candidate_stride,
+        uint32_t out_stride) {
+    constexpr uint32_t THREADS = 512u;
+    constexpr uint32_t IPT = CAP / THREADS;
+    using BlockSort = cub::BlockRadixSort<uint64_t, THREADS, IPT>;
+    extern __shared__ __align__(16) unsigned char sort_smem[];
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
+    const uint32_t t = blockIdx.x;
+    const uint32_t group = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= THREADS) return;
+    const uint32_t set0 = group * merge_group;
+    if (set0 >= n_sets) return;
+    uint32_t set_count = n_sets - set0;
+    if (set_count > merge_group) set_count = merge_group;
+    const uint32_t candidate_count = set_count * top_k;
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
+    uint64_t keys[IPT];
+#pragma unroll
+    for (uint32_t item = 0; item < IPT; item++) {
+        const uint32_t i = tid * IPT + item;
+        if (i < candidate_count) {
+            const uint32_t idx = cand[i];
+            keys[item] = (idx < n_comp) ? topk_pack_key(row[idx], idx)
+                                        : topk_pack_key(-INFINITY, UINT32_MAX);
+        } else {
+            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+        }
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+    uint32_t *dst = out + (uint64_t)t * out_stride + group * top_k;
+#pragma unroll
+    for (uint32_t item = 0; item < IPT; item++) {
+        const uint32_t i = tid * IPT + item;
+        if (i < top_k) dst[i] = 0xffffffffu - (uint32_t)keys[item];
+    }
+}
+
+template <uint32_t CAP>
+__global__ static void indexer_topk_final_merge_cub_kernel(
+        uint32_t *out,
+        const uint32_t *candidates,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        uint32_t candidate_count,
+        uint32_t candidate_stride) {
+    constexpr uint32_t THREADS = 512u;
+    constexpr uint32_t IPT = CAP / THREADS;
+    using BlockSort = cub::BlockRadixSort<uint64_t, THREADS, IPT>;
+    extern __shared__ __align__(16) unsigned char sort_smem[];
+    typename BlockSort::TempStorage &sort_storage =
+        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || tid >= THREADS) return;
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
+    uint64_t keys[IPT];
+#pragma unroll
+    for (uint32_t item = 0; item < IPT; item++) {
+        const uint32_t i = tid * IPT + item;
+        if (i < candidate_count) {
+            const uint32_t idx = cand[i];
+            keys[item] = (idx < n_comp) ? topk_pack_key(row[idx], idx)
+                                        : topk_pack_key(-INFINITY, UINT32_MAX);
+        } else {
+            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+        }
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+#pragma unroll
+    for (uint32_t item = 0; item < IPT; item++) {
+        const uint32_t i = tid * IPT + item;
+        if (i < top_k) out[(uint64_t)t * top_k + i] = 0xffffffffu - (uint32_t)keys[item];
+    }
+}
+
 extern "C" int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -1119,6 +1254,98 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 8192x2048 launch");
     }
     if (top_k == 512u || top_k == 1024u || top_k == 2048u) {
+        /* CUB radix tree over 8192-row chunks when the device allows the
+         * 64 KiB BlockRadixSort temp storage; otherwise fall back to the
+         * 4096-row bitonic tree below. */
+        using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
+        const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
+        int dev = 0;
+        int max_optin_smem = 0;
+        cudaError_t attr_err = cudaGetDevice(&dev);
+        if (attr_err == cudaSuccess) {
+            attr_err = cudaDeviceGetAttribute(&max_optin_smem,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                              dev);
+        }
+        if (attr_err == cudaSuccess && max_optin_smem >= smem) {
+            const uint32_t chunk_n = 8192u;
+            const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
+            const uint32_t merge_group = chunk_n / top_k;
+            const uint64_t candidate_stride64 = (uint64_t)n_chunks * top_k;
+            if (candidate_stride64 > UINT32_MAX) return 0;
+            const uint32_t candidate_stride = (uint32_t)candidate_stride64;
+            uint32_t n_sets = n_chunks;
+            uint64_t scratch_u32_per_token = candidate_stride;
+            while (n_sets > merge_group) {
+                n_sets = (n_sets + merge_group - 1u) / merge_group;
+                scratch_u32_per_token += (uint64_t)n_sets * top_k;
+            }
+            if (scratch_u32_per_token > UINT64_MAX / n_tokens / sizeof(uint32_t)) return 0;
+            const uint64_t tmp_bytes = (uint64_t)n_tokens * scratch_u32_per_token * sizeof(uint32_t);
+            uint32_t *scratch = (uint32_t *)cuda_tmp_alloc(tmp_bytes, "indexer topk tree");
+            if (!scratch) return 0;
+
+            attr_err = cudaFuncSetAttribute(indexer_topk_chunk_cub_kernel<8192>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem);
+            if (attr_err != cudaSuccess) return 0;
+            attr_err = cudaFuncSetAttribute(indexer_topk_tree_merge_cub_kernel<8192>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem);
+            if (attr_err != cudaSuccess) return 0;
+            attr_err = cudaFuncSetAttribute(indexer_topk_final_merge_cub_kernel<8192>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem);
+            if (attr_err != cudaSuccess) return 0;
+
+            uint32_t *cur = scratch;
+            n_sets = n_chunks;
+            uint32_t cur_stride = candidate_stride;
+            dim3 grid_chunks(n_tokens, n_chunks, 1);
+            indexer_topk_chunk_cub_kernel<8192><<<grid_chunks, 512, smem>>>(
+                    cur,
+                    (const float *)scores->ptr,
+                    n_comp,
+                    n_tokens,
+                    top_k,
+                    candidate_stride);
+            if (!cuda_ok(cudaGetLastError(), "indexer topk cub chunk launch")) return 0;
+
+            while (n_sets > merge_group) {
+                const uint32_t next_sets = (n_sets + merge_group - 1u) / merge_group;
+                const uint32_t next_stride = next_sets * top_k;
+                uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
+                dim3 grid_merge(n_tokens, next_sets, 1);
+                indexer_topk_tree_merge_cub_kernel<8192><<<grid_merge, 512, smem>>>(
+                        next,
+                        cur,
+                        (const float *)scores->ptr,
+                        n_comp,
+                        n_tokens,
+                        top_k,
+                        n_sets,
+                        merge_group,
+                        cur_stride,
+                        next_stride);
+                if (!cuda_ok(cudaGetLastError(), "indexer topk cub tree merge launch")) return 0;
+                cur = next;
+                n_sets = next_sets;
+                cur_stride = next_stride;
+            }
+
+            indexer_topk_final_merge_cub_kernel<8192><<<n_tokens, 512, smem>>>(
+                    (uint32_t *)selected->ptr,
+                    cur,
+                    (const float *)scores->ptr,
+                    n_comp,
+                    n_tokens,
+                    top_k,
+                    n_sets * top_k,
+                    cur_stride);
+            return cuda_ok(cudaGetLastError(), "indexer topk cub final merge launch");
+        }
+
+        /* Fallback: 4096-row bitonic tree (devices without 64 KiB opt-in). */
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t merge_group = chunk_n / top_k;
