@@ -12173,7 +12173,14 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
+#ifdef DS4_ROCM_BUILD
+            /* ROCm (Strix Halo): 8192-token chunks measured 5-6% faster
+             * prefill than 4096 (better GEMM utilization, fewer launches).
+             * The raw SWA cache grows to match (raw_kv_rows=8192). */
+            cap = 8192u;
+#else
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+#endif
         }
     }
 

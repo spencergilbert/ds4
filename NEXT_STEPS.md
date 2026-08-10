@@ -90,6 +90,14 @@ Sparse sweep CSV/SVG: `speed-bench/strix_halo_idx.csv` + `_ts.svg` (2K, 32K,
 64K, 128K, 384K). All three changes are bit-identical (logit JSON diff at
 8K/64K).
 
+### 4. Prefill chunk 8192 for ROCm (DONE 2026-08-10)
+
+`--prefill-chunk 8192` (and now the ROCm default in `ds4_prefill_cap_for_prompt`)
+measures **+5-6%** everywhere (better GEMM utilization, fewer launches):
+64K 198.3 → 208.2, 128K 172.2 → 179.9, 384K 114.9 → 121.5 t/s. 16384-token
+chunks exceed the raw SWA cache cap (8192) and fail. Raw SWA cache grows to
+8192 rows (+~1 GiB across layers).
+
 ## rocBLAS / hipBLAS Tuning: Tested, No Effect
 
 - `ROCBLAS_GEMM_ALGO_ALWAYS=1`: 191.3 vs 192.6 t/s baseline — noise.
