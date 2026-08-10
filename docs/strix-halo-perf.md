@@ -60,6 +60,29 @@ double-buffered a_sh): 182.6 → 129.3 ms at 16384 comps x 4096 tokens,
 **bit-identical logits**. End-to-end: 64K 192.5 → 198.8 t/s, 128K 163.2 →
 171.3 t/s.
 
+**Final (2026-08-10, after top-k CUB tree, fp16 indexer q, and the 8192-token
+prefill chunk default):**
+
+| ctx | original | final | Δ |
+|---|---|---|---|
+| 64K | 192.6 | 208.2 | +8.1% |
+| 128K | 163.2 | 179.9 | +10.2% |
+| 384K | 102.0 | 121.5 | +19.1% (64 → 54 min) |
+
+## Remaining Cost Profile (8192-token chunks, layer 0 at 64K tail)
+
+| stage | ms/8192-token layer | share |
+|---|---|---|
+| routed MoE (iq2/q2k kernels) | ~298 | ~43% |
+| attention output projection | ~107 | ~16% |
+| Q path | ~81 | ~12% |
+| attention (non-indexer layers) | ~72 | ~10% |
+| shared experts, HC, router, ... | ~127 | ~19% |
+
+MoE is ~3.3 TFLOP per 8192-token layer at ~11 TFLOPS effective (2-bit
+weights, custom dequant-in-kernel). Indexer scores + top-k + indexed
+attention together are ~2.4x cheaper than the MoE after the rewrites.
+
 ## Code Fixes Applied
 
 See commit `0bccfdd` on branch `fedora44-ds4`.
