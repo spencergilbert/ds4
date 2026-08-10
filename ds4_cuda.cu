@@ -3049,7 +3049,7 @@ extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
-    uint64_t reserve = total_bytes / 4u;
+    uint64_t reserve = total_bytes / 8u;
     if (reserve < min_reserve) reserve = min_reserve;
     if (reserve > max_reserve) reserve = max_reserve;
     return reserve;
@@ -3058,15 +3058,12 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
-    /* Very large KV caches are where device-only cudaMalloc() can make a
-     * unified-memory machine unresponsive.  Managed memory restores the old
-     * demand-paged behavior for this one long-lived allocation class only. */
-    const uint64_t huge_kv = 8ull * 1073741824ull;
-    if (kv_cache_bytes >= huge_kv) return 1;
-
-    const uint64_t large_context = 8ull * 1073741824ull;
-    if (context_bytes < large_context) return 0;
-
+    /* Managed memory restores the old demand-paged behavior for the one
+     * long-lived KV class.  The decision must follow actual device headroom:
+     * a hard size cutoff forces slow host-managed KV even on machines with
+     * plenty of free device memory (e.g. Strix Halo SSD streaming, where only
+     * the token embedding is resident).  Only fall back to managed memory when
+     * the context would not fit in device memory with the usual reserve. */
     size_t free_b = 0;
     size_t total_b = 0;
     cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
