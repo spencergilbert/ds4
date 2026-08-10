@@ -15190,6 +15190,7 @@ typedef struct {
     ds4_gpu_tensor *batch_comp_kv_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_comp_sc_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_indexer_q_by_tier[DS4_MAX_GPUS];
+    ds4_gpu_tensor *batch_indexer_q_half_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_indexer_weights_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_heads_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_attn_low_by_tier[DS4_MAX_GPUS];
@@ -15314,6 +15315,7 @@ typedef struct {
     X(batch_heads)                          \
     X(batch_indexer_weights)                \
     X(batch_indexer_q)                      \
+    X(batch_indexer_q_half)                 \
     X(batch_comp_sc)                        \
     X(batch_comp_kv)                        \
     X(batch_kv)                             \
@@ -15430,6 +15432,7 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_kv)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_comp_kv)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_comp_sc)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_indexer_q)
+DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_indexer_q_half)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_indexer_weights)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_heads)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_attn_low)
@@ -17376,6 +17379,7 @@ static bool metal_graph_alloc_raw_cap(
             g->batch_comp_kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
             g->batch_comp_sc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
             g->batch_indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * indexer_q_dim * sizeof(float));
+            g->batch_indexer_q_half_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * indexer_q_dim * sizeof(uint16_t));
             g->batch_indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_INDEXER_HEAD * sizeof(float));
             g->batch_heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
             g->batch_attn_low_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * low_dim * sizeof(float));
@@ -17471,7 +17475,7 @@ static bool metal_graph_alloc_raw_cap(
             g->batch_qr_by_tier[t] && g->batch_qr_norm_by_tier[t] && g->batch_q_by_tier[t] &&
             g->batch_kv_raw_by_tier[t] && g->batch_kv_by_tier[t] &&
             g->batch_comp_kv_by_tier[t] && g->batch_comp_sc_by_tier[t] &&
-            g->batch_indexer_q_by_tier[t] && g->batch_indexer_weights_by_tier[t] &&
+            g->batch_indexer_q_by_tier[t] && g->batch_indexer_q_half_by_tier[t] && g->batch_indexer_weights_by_tier[t] &&
             g->batch_heads_by_tier[t] && g->batch_attn_low_by_tier[t] && g->batch_attn_out_by_tier[t] &&
             g->batch_group_tmp_by_tier[t] && g->batch_low_tmp_by_tier[t] && g->batch_after_attn_hc_by_tier[t] &&
             g->batch_ffn_cur_by_tier[t] && g->batch_ffn_norm_by_tier[t] &&
@@ -28998,9 +29002,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(metal_graph_batch_indexer_q(g),
-                                                          n_tokens * DS4_N_INDEXER_HEAD,
-                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
+            if (ok) ok = ds4_gpu_dsv4_indexer_qat_f16_tensor(metal_graph_batch_indexer_q(g),
+                                                               metal_graph_batch_indexer_q_half(g),
+                                                               n_tokens * DS4_N_INDEXER_HEAD,
+                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
             if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
                                                      model->map,
                                                      model->size,
@@ -29266,17 +29271,18 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
-                ok = ds4_gpu_indexer_scores_decode_batch_tensor(metal_graph_indexer_scores(g),
-                                                                  metal_graph_batch_indexer_q(g),
-                                                                  metal_graph_batch_indexer_weights(g),
-                                                                  g->layer_index_comp_cache[il],
-                                                                  n_comp,
-                                                                  n_tokens,
-                                                                  pos0,
-                                                                  DS4_N_INDEXER_HEAD,
-                                                                  DS4_N_INDEXER_HEAD_DIM,
-                                                                  ratio,
-                                                                  index_scale) != 0;
+                ok = ds4_gpu_indexer_scores_decode_batch_f16_tensor(metal_graph_indexer_scores(g),
+                                                                     metal_graph_batch_indexer_q_half(g),
+                                                                     metal_graph_batch_indexer_q(g),
+                                                                     metal_graph_batch_indexer_weights(g),
+                                                                     g->layer_index_comp_cache[il],
+                                                                     n_comp,
+                                                                     n_tokens,
+                                                                     pos0,
+                                                                     DS4_N_INDEXER_HEAD,
+                                                                     DS4_N_INDEXER_HEAD_DIM,
+                                                                     ratio,
+                                                                     index_scale) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                     il,
@@ -29387,16 +29393,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
-            ok = ds4_gpu_indexer_scores_prefill_tensor(metal_graph_indexer_scores(g),
-                                                         metal_graph_batch_indexer_q(g),
-                                                         metal_graph_batch_indexer_weights(g),
-                                                         g->layer_index_comp_cache[il],
-                                                         n_comp,
-                                                         n_tokens,
-                                                         DS4_N_INDEXER_HEAD,
-                                                         DS4_N_INDEXER_HEAD_DIM,
-                                                         ratio,
-                                                         index_scale) != 0;
+            ok = ds4_gpu_indexer_scores_prefill_f16_tensor(metal_graph_indexer_scores(g),
+                                                            metal_graph_batch_indexer_q_half(g),
+                                                            metal_graph_batch_indexer_q(g),
+                                                            metal_graph_batch_indexer_weights(g),
+                                                            g->layer_index_comp_cache[il],
+                                                            n_comp,
+                                                            n_tokens,
+                                                            DS4_N_INDEXER_HEAD,
+                                                            DS4_N_INDEXER_HEAD_DIM,
+                                                            ratio,
+                                                            index_scale) != 0;
             if (ok && index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                 il,
@@ -49285,6 +49292,7 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     total += pc * comp_width_max * sizeof(float);          /* batch_comp_kv_by_tier */
     total += pc * comp_width_max * sizeof(float);          /* batch_comp_sc_by_tier */
     total += pc * indexer_q_dim * sizeof(float);           /* batch_indexer_q_by_tier */
+    total += pc * indexer_q_dim * sizeof(uint16_t);        /* batch_indexer_q_half_by_tier */
     total += pc * (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float); /* batch_indexer_weights */
     total += pc * q_dim * sizeof(float);                   /* batch_heads_by_tier */
     total += pc * low_dim * sizeof(float);                 /* batch_attn_low_by_tier */

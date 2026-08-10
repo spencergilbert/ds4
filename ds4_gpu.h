@@ -498,6 +498,33 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+int ds4_gpu_indexer_scores_prefill_f16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q16,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale);
+
+int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q16,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale);
+
 int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         const ds4_gpu_tensor *logits_row,
                                         const void *model_map,
@@ -1138,7 +1165,11 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim);
 
-
+int ds4_gpu_dsv4_indexer_qat_f16_tensor(
+        ds4_gpu_tensor *x,
+        ds4_gpu_tensor *x16,
+        uint32_t          n_rows,
+        uint32_t          head_dim);
 
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,

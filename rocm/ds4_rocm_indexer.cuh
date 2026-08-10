@@ -1,4 +1,4 @@
-__global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
+__global__ static void indexer_hadamard_fp4_kernel(float *x, __half *x16, uint32_t n_rows, uint32_t head_dim) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
@@ -37,7 +37,9 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
 
     float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
     float scale = exp2f(ceilf(log2f(amax / 6.0f)));
-    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+    const float out = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+    xr[tid] = out;
+    if (x16) x16[(uint64_t)row * head_dim + tid] = __float2half(out);
 }
 
 __global__ static void indexer_scores_kernel(
@@ -125,9 +127,17 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid == 0) scores[c] = total;
 }
 
-__global__ static void indexer_scores_wmma128_kernel(
+__device__ __forceinline__ static __half indexer_q_load(const float *q, uint64_t off) {
+    return __float2half(q[off]);
+}
+__device__ __forceinline__ static __half indexer_q_load(const __half *q, uint64_t off) {
+    return q[off];
+}
+
+template <typename QT>
+__global__ static void indexer_scores_wmma128_kernel_t(
         float *scores,
-        const float *q,
+        const QT *q,
         const float *weights,
         const float *index_comp,
         uint32_t n_comp,
@@ -202,11 +212,11 @@ __global__ static void indexer_scores_wmma128_kernel(
         const uint32_t r = i >> 7u;
         const uint32_t d = i & 127u;
         const uint32_t token = tile_t + r;
-        float v = 0.0f;
+        __half v = __float2half(0.0f);
         if (token < n_tokens) {
-            v = q[((uint64_t)token * n_head + 0u) * head_dim + d];
+            v = indexer_q_load(q, ((uint64_t)token * n_head + 0u) * head_dim + d);
         }
-        a_sh[0][r * 136u + d] = __float2half(v);
+        a_sh[0][r * 136u + d] = v;
     }
     __syncthreads();
 
@@ -217,11 +227,11 @@ __global__ static void indexer_scores_wmma128_kernel(
                 const uint32_t r = i >> 7u;
                 const uint32_t d = i & 127u;
                 const uint32_t token = tile_t + r;
-                float v = 0.0f;
+                __half v = __float2half(0.0f);
                 if (token < n_tokens) {
-                    v = q[((uint64_t)token * n_head + h + 1u) * head_dim + d];
+                    v = indexer_q_load(q, ((uint64_t)token * n_head + h + 1u) * head_dim + d);
                 }
-                a_sh[(h + 1u) & 1u][r * 136u + d] = __float2half(v);
+                a_sh[(h + 1u) & 1u][r * 136u + d] = v;
             }
         }
 
@@ -892,12 +902,12 @@ static int indexer_scores_launch(
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
-        indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                                     (const float *)q->ptr,
-                                                     (const float *)weights->ptr,
-                                                     (const float *)index_comp->ptr,
-                                                     n_comp, n_tokens, pos0, n_head,
-                                                     head_dim, ratio, scale, causal ? 1 : 0);
+        indexer_scores_wmma128_kernel_t<float><<<grid, 256>>>((float *)scores->ptr,
+                                                              (const float *)q->ptr,
+                                                              (const float *)weights->ptr,
+                                                              (const float *)index_comp->ptr,
+                                                              n_comp, n_tokens, pos0, n_head,
+                                                              head_dim, ratio, scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
     }
     dim3 grid(n_comp, n_tokens, 1);
@@ -908,6 +918,72 @@ static int indexer_scores_launch(
                                          n_comp, n_tokens, pos0, n_head,
                                          head_dim, ratio, scale, causal ? 1 : 0);
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
+}
+
+/* fp16-q variant of the batch scores launch: the QAT step has already
+ * converted the indexer q to fp16 (bit-identical MMA inputs; the in-kernel
+ * __float2half is skipped and the a_sh staging reads half the bytes).
+ * Falls back to the fp32 one-token kernel when n_tokens == 1. */
+static int indexer_scores_f16q_launch(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q16,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale) {
+    if (!scores || !q16 || !weights || !index_comp ||
+        n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        q16->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(__half) ||
+        weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
+        index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+        return 0;
+    }
+    if (ratio == 0) return 0;
+    if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
+        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
+                                                         (const float *)q->ptr,
+                                                         (const float *)weights->ptr,
+                                                         (const float *)index_comp->ptr,
+                                                         n_comp, pos0, ratio,
+                                                         scale, 1);
+        return cuda_ok(cudaGetLastError(), "indexer score one direct f16q launch");
+    }
+    if (n_tokens > 1u && !g_quality_mode && head_dim == 128u && n_head == 64u) {
+        dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
+        indexer_scores_wmma128_kernel_t<__half><<<grid, 256>>>((float *)scores->ptr,
+                                                              (const __half *)q16->ptr,
+                                                              (const float *)weights->ptr,
+                                                              (const float *)index_comp->ptr,
+                                                              n_comp, n_tokens, pos0, n_head,
+                                                              head_dim, ratio, scale, 1);
+        return cuda_ok(cudaGetLastError(), "indexer scores wmma128 f16q launch");
+    }
+    return 0;
+}
+
+extern "C" int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q16,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale) {
+    return indexer_scores_f16q_launch(scores, q16, q, weights, index_comp,
+                                      n_comp, n_tokens, pos0, n_head, head_dim,
+                                      ratio, scale);
 }
 
 extern "C" int ds4_gpu_indexer_score_one_tensor(
@@ -921,6 +997,23 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0);
+}
+
+extern "C" int ds4_gpu_indexer_scores_prefill_f16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q16,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale) {
+    return indexer_scores_f16q_launch(scores, q16, q, weights, index_comp,
+                                      n_comp, n_tokens, 0, n_head, head_dim,
+                                      ratio, scale);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
@@ -1511,6 +1604,16 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
+    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, NULL, n_rows, head_dim);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
+}
+
+extern "C" int ds4_gpu_dsv4_indexer_qat_f16_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *x16, uint32_t n_rows, uint32_t head_dim) {
+    if (!x || !x16 || n_rows == 0 || head_dim != 128u ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        x16->bytes < (uint64_t)n_rows * head_dim * sizeof(__half)) {
+        return 0;
+    }
+    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, (__half *)x16->ptr, n_rows, head_dim);
+    return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 f16 launch");
 }
