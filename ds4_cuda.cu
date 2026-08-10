@@ -12574,8 +12574,10 @@ __global__ static void indexer_scores_wmma128_kernel(
 
     /* The padded stride avoids ldmatrix bank conflicts. Two token tiles
      * share each staged index fragment, while WMMA accumulators remain in
-     * registers through the head reduction. */
-    __shared__ __half a_sh[32 * 136];
+     * registers through the head reduction.  a_sh is double-buffered so the
+     * next head's global q fetch + fp16 convert overlaps the current head's
+     * MMA work and the per-head barrier count drops from two to one. */
+    __shared__ __half a_sh[2][32 * 136];
     __shared__ __half b_sh[128 * 136];
 
     const uint32_t lane = tid & 31u;
@@ -12604,28 +12606,45 @@ __global__ static void indexer_scores_wmma128_kernel(
     const uint32_t t1_lo = tile_t + 16u + quad;
     const uint32_t t1_hi = tile_t + 24u + quad;
 
-    for (uint32_t h = 0; h < n_head; h++) {
-        for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
-            const uint32_t r = i >> 7u;
-            const uint32_t d = i & 127u;
-            const uint32_t token = tile_t + r;
-            float v = 0.0f;
-            if (token < n_tokens) {
-                v = q[((uint64_t)token * n_head + h) * head_dim + d];
-            }
-            a_sh[r * 136u + d] = __float2half(v);
+    /* Stage head 0 into buffer 0 before the loop. */
+    for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
+        const uint32_t r = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t token = tile_t + r;
+        float v = 0.0f;
+        if (token < n_tokens) {
+            v = q[((uint64_t)token * n_head + 0u) * head_dim + d];
         }
-        __syncthreads();
+        a_sh[0][r * 136u + d] = __float2half(v);
+    }
+    __syncthreads();
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        /* Prefetch head h+1 into the other buffer; the loads overlap the
+         * MMA below and the single trailing barrier makes them visible. */
+        if (h + 1u < n_head) {
+            for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
+                const uint32_t r = i >> 7u;
+                const uint32_t d = i & 127u;
+                const uint32_t token = tile_t + r;
+                float v = 0.0f;
+                if (token < n_tokens) {
+                    v = q[((uint64_t)token * n_head + h + 1u) * head_dim + d];
+                }
+                a_sh[(h + 1u) & 1u][r * 136u + d] = __float2half(v);
+            }
+        }
 
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a0, a1;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> c0, c1;
         wmma::fill_fragment(c0, 0.0f);
         wmma::fill_fragment(c1, 0.0f);
+        const __half *a_cur = a_sh[h & 1u];
         const uint32_t col0 = warp * 16u;
         for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a0, a_sh + k0, 136);
-            wmma::load_matrix_sync(a1, a_sh + 16u * 136u + k0, 136);
+            wmma::load_matrix_sync(a0, a_cur + k0, 136);
+            wmma::load_matrix_sync(a1, a_cur + 16u * 136u + k0, 136);
             wmma::load_matrix_sync(b_frag, b_sh + col0 * 136u + k0, 136);
             wmma::mma_sync(c0, a0, b_frag, c0);
             wmma::mma_sync(c1, a1, b_frag, c1);

@@ -33,22 +33,32 @@ See `speed-bench/strix_halo.csv` and `speed-bench/strix_halo_ssd.csv`.
 - Prefill 3–4× slower than resident (expert loading from SSD)
 - Gen ~20–25% slower (most experts stay in cache after first pass)
 
-## The 64K Context Cliff
+## The 64K Context Cliff (Revised 2026-08-10)
 
-The DeepSeek RoPE original context is **65,536**. Above this, the model switches
-to YaRN frequency scaling on ROCm, causing catastrophic prefill collapse:
+**Update:** the earlier "72x attention cliff" does not reproduce on the current
+binary. DeepSeek V4 Flash uses a compressed-KV indexer: once `n_comp > 512`
+(`DS4_N_INDEXER_TOP_K`), prefill attention runs the **indexed online kernel**
+(fixed top-k 512 + 128-token raw window), whose cost is flat in context. The
+`cublasGemmStridedBatchedEx` S-matrix path only runs for `n_comp <= 512`.
 
-| ctx | compressed KV rows | mechanism | 2048-token prefill |
-|---|---|---|---|
-| 64K | 16,418 | RoPE (native) | **~11 s** (~188 t/s) |
-| 66K | 16,801 | YaRN scaling | **>60 s** (<34 t/s) |
-| 200K | ~50,000 | YaRN scaling | **>8 min** (~0.2 t/s) |
-| 384K | 98,306 | YaRN scaling | **>11 min** (~0.1 t/s) |
-| 1M | 262,146 | YaRN + managed KV | **>45 min** (never finished) |
+The real context-scaling cost is the **indexer scores GEMM** (WMMA128 kernel,
+O(n_comp) per chunk) plus indexer top-k. Measured per 4096-token layer/chunk:
 
-**Root cause:** The prefill attention uses `cublasGemmStridedBatchedEx`
-(hipBLAS/rocBLAS) with `CUBLAS_GEMM_DEFAULT`. At compressed-KV rows above
-~16K, rocBLAS picks a suboptimal tiling strategy and throughput collapses.
+| ctx | compressed KV rows | indexer score | indexed attention | prefill t/s (full) |
+|---|---|---|---|---|
+| 64K | 16,386 | ~181 ms | ~108 ms | 192.5 |
+| 128K | 32,770 | ~360 ms | ~108 ms | 163.2 |
+| 200K | 49,154 | ~540 ms | ~108 ms | 142.7 |
+| 384K | 98,306 | ~1.1 s | ~108 ms | 102.0 |
+
+Prefill degrades linearly (indexer scores dominate), not catastrophically.
+384K is ~1.9x slower than 64K, not 72x.
+
+The indexer scores WMMA128 kernel was rewritten (32-token blocks, register-
+resident weighted-ReLU reduction with the measured rocwmma accumulator layout,
+double-buffered a_sh): 182.6 → 129.3 ms at 16384 comps x 4096 tokens,
+**bit-identical logits**. End-to-end: 64K 192.5 → 198.8 t/s, 128K 163.2 →
+171.3 t/s.
 
 ## Code Fixes Applied
 
@@ -82,69 +92,50 @@ GLM 5.2 UD-Q2_K_RoutedQ2K (262 GB) tested and found infeasible:
 - 1.47 t/s gen, 12.7 t/s prefill
 - Read amplification 2.4× and climbing after frontier 1; frontier 2 never finished
 
-## Performance Fixes for >64K Contexts
+## Performance Fixes for >64K Contexts (Revised 2026-08-10)
 
-### rocBLAS / hipBLAS Tuning (no code changes)
+### Status of the old rocBLAS / hipBLAS tuning plan — tested, no effect
 
-System-level env vars — may or may not help depending on whether gfx1151
-has pre-tuned kernels in the tensile library:
+- `ROCBLAS_GEMM_ALGO_ALWAYS=1`: 191.3 vs 192.6 t/s baseline — noise.
+- `ROCBLAS_TENSORLIB_PATH` / `HIPBLASLT_TENSORLIB_PATH`: gfx1151 tensile
+  libraries exist (`/usr/lib64/rocblas/library/`, `/usr/lib64/hipblaslt/library/`)
+  but there are no per-shape YAML autotune files to point at.
+- The hipBLASLt plan machinery (`rocm/ds4_rocm_hipblaslt.cuh`,
+  `MAX_WORKSPACE_BYTES`, the 8 heuristic candidates) is **dead code** on this
+  branch — `hipblaslt_gemm_tn_f16_out_f16` has no callers; fp16 GEMMs use
+  `cublasGemmEx(..., CUBLAS_GEMM_DEFAULT)` → rocBLAS directly.
+- The proposed `CUBLAS_GEMM_DEFAULT` replacement targets the S-matrix
+  attention path, which the indexer model only uses for `n_comp <= 512`.
 
-| variable | effect |
-|---|---|
-| `ROCBLAS_TENSORLIB_PATH` | path to tensile library YAML — enables per-shape autotuning |
-| `HIPBLASLT_TENSORLIB_PATH` | same for hipBLASLt |
-| `ROCBLAS_GEMM_ALGO_ALWAYS=1` | force rocBLAS to always query tensile |
+### The real fix: indexer scores WMMA128 kernel (`rocm/ds4_rocm_indexer.cuh`)
 
-Code-level tuning (ds4 changes):
+The prefill indexer scores GEMM (n_comp x n_tokens x 64 heads x 128 dims,
+weighted ReLU per head) is the dominant context-scaling cost. Rewritten:
+- 32 tokens per block (was 16) — halves per-layer q re-reads and block count
+- Register-resident weighted-ReLU head reduction (no c_sh round trip), using
+  the measured rocwmma gfx1151 accumulator layout: element i of lane l holds
+  (row = 2*i + (l>>4), col = l & 15) — this differs from nvcuda
+- Double-buffered a_sh, 1 barrier per head (was 3)
 
-1. `rocm/ds4_rocm_hipblaslt.cuh`: set `MAX_WORKSPACE_BYTES` to 64 MiB
-   so the heuristic considers scratch-space algorithms for large GEMMs.
-2. Try all 8 candidates from `hipblasLtMatmulAlgoGetHeuristic`, not just `heur[0]`.
-3. `rocm/ds4_rocm_runtime.cuh`: replace `CUBLAS_GEMM_DEFAULT` with an explicit
-   algorithm search when compressed rows exceed 16K.
+Micro-benchmark at 16384 comps x 4096 tokens: 182.6 ms → 129.3 ms
+(6.0 → 8.5 TFLOPS), **bit-identical** outputs. End-to-end: 64K 192.5 →
+198.8 t/s, 128K 163.2 → 171.3 t/s. 384K re-run pending.
 
-### FlashAttention via HIP Kernel
+Remaining ideas: indexer top-k pass (~26 ms/layer at 64K, scales with
+n_comp), fp16 q/index_comp pre-pass (halves the ~16 GB/layer q re-read
+memory traffic, bit-identical MMA inputs), 64-token blocks (LDS-bound).
 
-The indexed-prefill attention shape:
-`Q[n_tok×128, 64] @ K^T[64, n_kv_rows×128]`. At 384K ctx, the attention matrix
-`S` is 805 MB per head. FA avoids materializing `S` by streaming K/V blocks
-through LDS with online softmax.
+### FlashAttention via HIP Kernel — not needed
+
+Attention is already flat in context via the indexed online kernel
+(`attention_indexed_mixed_heads8_online_kernel`, fixed top-k 512 + raw
+window). There is no attention cliff to fix; skip FA unless the indexed
+attention itself becomes the bottleneck (it is ~108 ms/layer at any ctx,
+vs ~1.1 s for indexer scores at 384K).
 
 **Prerequisites:**
 - rocWMMA installed per `STRIX_HALO.md` (warp-level MMA for gfx1151)
 - HIP LDS: 64 KB per CU on gfx1151 — constrains tile sizes
-
-**Kernel sketch:**
-
-```
-Input:  Q [n_tok, n_heads, head_dim]       e.g. [2048, 128, 64]
-        K [n_kv_rows, n_heads, head_dim]   e.g. [98306, 128, 64]
-        V [n_kv_rows, n_heads, head_dim]
-Output: O [n_tok, n_heads, head_dim]
-
-Block:  Br=64 tokens, 1 head
-        Qi_tile[Br, 64] in LDS (8 KB)
-        Oi[Br, 64], mi[Br], li[Br] in registers
-
-Loop over K/V streamed in Bc=256-row tiles (32 KB LDS + Qi):
-  Sij[Br, Bc] = Qi_tile @ Kj_tile^T     (rocWMMA)
-  mij = rowmax(Sij), lij = rowsum(exp(Sij - mij))
-  Oi = diag(exp(mi - mij)) * Oi + exp(Sij - mij) @ Vj
-  mi = max(mi, mij); li = exp(mi - mij) * li + lij
-
-Output: O[block] = diag(1/li) * Oi
-```
-
-**Tile sizes (64 KB LDS):** Br = 64 (8 KB Q tile), Bc_sub = 256 (32 KB K tile).
-
-**Memory:** O(n_tok × n_kv) global reads (K/V streamed), O(n_tok × heads × dim)
-writes (O once). No S matrix materialization.
-
-**Integration points:**
-- Replace `cublasGemmStridedBatchedEx` / `hipblasLtMatmul` when
-  `n_kv_rows > 16384` and `backend == rocm`
-- Reuse existing `cuda_tmp_alloc()`, stream management
-- Template in `rocm/ds4_rocm_runtime.cuh` alongside existing GLM prefill kernels
 
 ### Env Vars (Strix Halo ROCm)
 
@@ -156,24 +147,29 @@ writes (O once). No S matrix materialization.
 | `DS4_BATCHED_ROPE_MAX` | 4096 | max tokens for batched CPU rope |
 | `DS4_PREFILL_PROFILE_DETAIL` | (unset) | time breakdown (DeepSeek — unimplemented) |
 | `DS4_PREFILL_CHUNK` | 4096 | tokens per GPU prefill chunk |
+| `DS4_ROCM_INDEXER_STAGE_PROFILE` | (unset) | per-layer indexer score/topk/attention timing |
+| `DS4_ROCM_LAYER_STAGE_PROFILE[_LAYER]` | (unset) | per-layer prefill stage timing |
 
-## Validation Plan (for FlashAttention)
+## Validation Plan (indexer kernel rewrite)
 
-1. **Correctness:** Compare FA output against GEMM path for all frontier
-   ctx values 2K–64K. Tolerance 1e-3 on logits (FP16 accumulation differs).
-2. **Prefill sweep at the cliff:** Run `ds4-bench --gen-tokens 0` at 65536,
-   131072, 262144, 393216. Verify prefill t/s recovers to within ~10× of 64K
-   (vs. current ~72× degradation). No OOM, no NaNs.
-3. **Generation consistency:** Run `--gen-tokens 128` at 64K and 128K.
-   KV cache bit-exact vs. GEMM path; gen t/s unchanged (FA prefill-only).
-4. **Long-running smoke:** Continuous 2K→128K growth with `--gen-tokens 16`
-   per frontier, verifying no cache drift over 100+ steps.
-5. **Benchmark:** Produce `speed-bench/strix_halo_fa.csv` + SVG, 2K→393K,
-   comparable to existing resident sweep.
+1. **Correctness:** logit dump (`--dump-frontier-logits-dir`) at 8K/64K must be
+   **bit-identical** to the old kernel (the rewrite preserves the exact MMA
+   math and accumulate order; verified 2026-08-10).
+2. **Prefill sweep:** `ds4-bench --gen-tokens 0` at 65536, 131072, 262144,
+   393216 — baseline was 192.5 / 163.2 / 142.7 / 102.0 t/s; the rewrite
+   measured 198.8 / 171.3 at 64K/128K.
+3. **Generation consistency:** `--gen-tokens 128` at 64K and 128K — the
+   indexer only feeds top-k selection; KV cache and gen t/s must be unchanged.
+4. **Long-running smoke:** continuous 2K→128K growth with `--gen-tokens 16`
+   per frontier, verifying no top-k drift.
+5. **Benchmark:** produce `speed-bench/strix_halo_fa.csv` + SVG, 2K→393K
+   (rename to `strix_halo_idx.csv` if FA is dropped).
 
 ## Commits on `fedora44-ds4`
 
 ```
+(rework) rocm: indexer scores WMMA128 — 32-token blocks, register-resident
+         weighted-ReLU reduction, double-buffered a_sh (1.47x, bit-exact)
 bb95f73 docs: add Strix Halo performance investigation
 0bccfdd rocm: improve managed-KV threshold, arena limit, and reserve
 d897da4 bench: add AMD Strix Halo resident and SSD streaming results
