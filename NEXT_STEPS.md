@@ -80,14 +80,15 @@ at 16384 comps × 4096 tokens. Same double-buffer applied to the CUDA
 
 Measured end-to-end (resident, gen-tokens 0):
 
-| ctx | before | after | Δ |
+| ctx | original | final (score+topk+fp16q) | Δ |
 |---|---|---|---|
-| 64K | 192.6 t/s | 198.3 t/s | +2.9% |
-| 128K | 163.2 t/s | 171.3 t/s | +4.9% |
-| 384K | 102.0 t/s | 112.6 t/s | +10.3% (58 min vs 64 min) |
+| 64K | 192.6 t/s | 198.3 t/s | +3.0% |
+| 128K | 163.2 t/s | 172.2 t/s | +5.5% |
+| 384K | 102.0 t/s | 114.9 t/s | +12.6% (64 → 57 min) |
 
 Sparse sweep CSV/SVG: `speed-bench/strix_halo_idx.csv` + `_ts.svg` (2K, 32K,
-64K, 128K, 384K).
+64K, 128K, 384K). All three changes are bit-identical (logit JSON diff at
+8K/64K).
 
 ## rocBLAS / hipBLAS Tuning: Tested, No Effect
 
