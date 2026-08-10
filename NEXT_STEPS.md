@@ -120,18 +120,25 @@ reference at every n_comp. Production stage profile: 26.6 → 24.8 ms at 64K
 (comp=16384), 44 ms at 128K tail (comp=32768). End-to-end 64K 198.9,
 128K 171.8 t/s (no regression).
 
-### 2. fp16 index inputs
+### 2. fp16 indexer q (DONE 2026-08-10)
 
-The scores kernel converts fp32→fp16 in-kernel. A pre-pass that stores q and
-`index_comp` as fp16 would halve the dominant memory traffic (~16 GB/layer of
-q re-reads at 64K) with **bit-identical** MMA inputs. q is [tokens×64×128]
-fp32; index_comp cache is [n_comp×128] fp32.
+The QAT step (`indexer_hadamard_fp4_kernel`) now also emits an fp16 copy of
+the rounded indexer q into a new `batch_indexer_q_half` graph buffer; the
+prefill scores kernels (`indexer_scores_wmma128_kernel_t<__half>`) read it
+directly (skipping in-kernel `__float2half`, halving a_sh staging traffic).
+The fp32 q is still written for the per-token fallback / decode / debug.
 
-### 3. Bigger tiles / occupancy
+**Bit-identical** logits at 8K. Score stage 120 → 113 ms at 64K,
+253 → 238 ms at 128K tail (~6%). The index_comp (k) side was NOT converted:
+it would require changing the compressor output + cache format + ~15
+consumer sites (incl. snapshot restore) for ~2-4% more — not worth it.
 
-64-token blocks would halve q traffic again (LDS is the constraint: 64KB
-limit, ~69.6KB needed at 136-stride; 128-stride is exactly 64KB and risky).
-Also try 512-thread blocks.
+### 3. Bigger tiles / occupancy (NOT pursued)
+
+64-token blocks exceed the 64 KiB LDS budget at the 136-stride (69.6 KiB).
+The score kernel is ~8.5 TFLOPS (vs ~15 fp32 peak) — likely issue/latency
+bound rather than bandwidth bound; the fp16-q change captured the cheap
+memory-side gain.
 
 ### 4. Validate & benchmark
 

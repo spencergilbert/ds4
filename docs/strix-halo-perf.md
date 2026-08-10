@@ -123,7 +123,13 @@ Micro-benchmark at 16384 comps x 4096 tokens: 182.6 ms → 129.3 ms
 
 Remaining ideas: indexer top-k pass (~26 ms/layer at 64K, scales with
 n_comp), fp16 q/index_comp pre-pass (halves the ~16 GB/layer q re-read
-memory traffic, bit-identical MMA inputs), 64-token blocks (LDS-bound).
+memory traffic, bit-identical MMA inputs).
+
+**Update 2026-08-10:** both landed. Top-k now uses a CUB radix tree over
+8192-row chunks (160 → 115 ms at 98K comps, bit-exact); the indexer q is
+converted to fp16 in the QAT step (score stage 120 → 113 ms at 64K,
+bit-identical). The index_comp (k) side stays fp32 — converting it needs a
+cache-format change across ~15 consumer sites for ~2-4% more.
 
 ### FlashAttention via HIP Kernel — not needed
 
@@ -168,8 +174,9 @@ vs ~1.1 s for indexer scores at 384K).
 ## Commits on `fedora44-ds4`
 
 ```
-(rework) rocm: indexer scores WMMA128 — 32-token blocks, register-resident
-         weighted-ReLU reduction, double-buffered a_sh (1.47x, bit-exact)
+fd054d2 rocm: fp16 indexer q for prefill scores (bit-exact, ~6% score stage)
+ac9c87a rocm: indexer top-k via CUB radix tree (1.3-1.4x, bit-exact)
+3f74827 rocm: rewrite indexer scores WMMA128 kernel (1.47x, bit-exact)
 bb95f73 docs: add Strix Halo performance investigation
 0bccfdd rocm: improve managed-KV threshold, arena limit, and reserve
 d897da4 bench: add AMD Strix Halo resident and SSD streaming results
