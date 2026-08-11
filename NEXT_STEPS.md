@@ -21,19 +21,29 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
      in flight; 4-head spills registers and is 10x slower)
    - weights preloaded to shared once; `b_sh` (fp16 index_comp) staged as
      before; causal mask and fully-masked early-out unchanged
-   Micro-bench (`/tmp/idxbench3/6/7.cu`): 1538 → 421 ms at 98304 comps ×
-   8192 tokens (8.6 → 31.3 TFLOPS; MMA-only ceiling ~43). **Bit-identical**
+   - **q16 head-major transpose**: the QAT step now writes the fp16 q as
+     `[head][token][dim]`, so the direct kernel's 16x16 a-tiles are
+     512-byte contiguous loads instead of 16 scattered rows (bit-exact;
+     score stage 60.8→53.8 ms at the 64K tail, 421→391 ms at 98K×8192
+     micro-bench = 33.7 TFLOPS)
+   Micro-bench (`/tmp/idxbench3/6/7/8.cu`): 1538 → 391 ms at 98304 comps ×
+   8192 tokens (8.6 → 33.7 TFLOPS; MMA-only ceiling ~43). **Bit-identical**
    logits at 16K (incl. a 16-token partial-tile tail chunk), 64K (0/129280
    diffs vs the pre-change binary). The direct kernel is used for all
    n_tokens > 1 (partial tiles read in-bounds of the pc-sized q buffer;
    out-of-range rows compute garbage that the token guards drop; weights
    loads are clamped).
    End-to-end prefill (8192-token chunks): 8K 251.2→252.7, 32K 237.3→243.0,
-   64K 219.3→229.4 (+4.6%), 128K 185.5→201.0 (+8.3%), 384K 124.7→142.7
-   (+14.5%, 54→46 min). Decode unchanged (~13 t/s). Production stage
-   profile at 64K tail (comp=16384, 8192-token chunk): score 181→61
+   64K 219.3→229.4 (+4.6%), 128K 185.5→202.4 (+9.1%), 384K 124.7→142.7
+   (+14.5%, 54→46 min; the q16 transpose adds ~1% more at 384K). Decode
+   unchanged (~13 t/s). Production stage
+   profile at 64K tail (comp=16384, 8192-token chunk): score 181→54
    ms/layer; top-k 49 ms, indexed attention 216 ms are now the bigger
-   indexer costs. CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`.
+   indexer costs (both probed in `/tmp/attnbench*`/`/tmp/topkbench*`:
+   attention is reduction-bound at its online-softmax floor — the 5-shuffle
+   warp reduction per row; a WMMA two-pass rewrite is the remaining big win
+   but needs fp16 q/kv so logits would change; the top-k 32-bit-key radix
+   idea is blocked by score+index needing ~50 bits). CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`.
 
 1. **Max usable context 512K → 1M (DONE 2026-08-11, `b210a95`)** — the model's full
    `context_length` (1M) now creates a session and prefills on Strix Halo. The

@@ -1169,6 +1169,7 @@ int ds4_gpu_dsv4_indexer_qat_f16_tensor(
         ds4_gpu_tensor *x,
         ds4_gpu_tensor *x16,
         uint32_t          n_rows,
+        uint32_t          n_head,
         uint32_t          head_dim);
 
 int ds4_gpu_rope_tail_tensor(

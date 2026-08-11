@@ -1,4 +1,4 @@
-__global__ static void indexer_hadamard_fp4_kernel(float *x, __half *x16, uint32_t n_rows, uint32_t head_dim) {
+__global__ static void indexer_hadamard_fp4_kernel(float *x, __half *x16, uint32_t n_rows, uint32_t head_dim, uint32_t n_head, uint32_t token_cap) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
@@ -39,7 +39,16 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, __half *x16, uint32
     float scale = exp2f(ceilf(log2f(amax / 6.0f)));
     const float out = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
     xr[tid] = out;
-    if (x16) x16[(uint64_t)row * head_dim + tid] = __float2half(out);
+    if (x16) {
+        /* The prefill scores direct-load kernel reads q as [head][token][dim]
+         * (contiguous 16x16 a-tiles, stride head_dim) instead of the
+         * token-major [token][head][dim] layout of the fp32 q. Transpose here
+         * so the WMMA a-fragment loads are 512-byte contiguous tiles instead
+         * of 16 scattered rows (measured +6% on the scores kernel, bit-exact). */
+        const uint32_t token = row / n_head;
+        const uint32_t head = row - token * n_head;
+        x16[((uint64_t)head * token_cap + token) * head_dim + tid] = __float2half(out);
+    }
 }
 
 __global__ static void indexer_scores_kernel(
@@ -313,7 +322,8 @@ __global__ static void indexer_scores_wmma128_direct_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        uint32_t pc) {
 #if __CUDA_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
 #ifdef __HIP_PLATFORM_AMD__
     namespace wmma = rocwmma;
@@ -371,8 +381,10 @@ __global__ static void indexer_scores_wmma128_direct_kernel(
     }
     __syncthreads();
 
-    const uint32_t q_stride = n_head * head_dim;
     const uint32_t col0 = warp * 16u;
+    /* q is [head][token][dim] (transposed by the QAT step): each head's
+     * 16-token x 16-dim a-tile is contiguous (stride head_dim), so the
+     * fragment loads hit a few cache lines instead of 16 scattered rows. */
     for (uint32_t h = 0; h < n_head; h += 2u) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a0, a1, b0, b1;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
@@ -381,16 +393,14 @@ __global__ static void indexer_scores_wmma128_direct_kernel(
         wmma::fill_fragment(c1, 0.0f);
         wmma::fill_fragment(d0, 0.0f);
         wmma::fill_fragment(d1, 0.0f);
-        const __half *q0 = q + (uint64_t)(tile_t + 0u) * q_stride + h * head_dim;
-        const __half *q1 = q + (uint64_t)(tile_t + 16u) * q_stride + h * head_dim;
-        const __half *r0 = q + (uint64_t)(tile_t + 0u) * q_stride + (h + 1u) * head_dim;
-        const __half *r1 = q + (uint64_t)(tile_t + 16u) * q_stride + (h + 1u) * head_dim;
+        const __half *qh0 = q + (uint64_t)h * pc * head_dim + (uint64_t)tile_t * head_dim;
+        const __half *qh1 = q + (uint64_t)(h + 1u) * pc * head_dim + (uint64_t)tile_t * head_dim;
 #pragma unroll
         for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a0, q0 + k0, q_stride);
-            wmma::load_matrix_sync(a1, q1 + k0, q_stride);
-            wmma::load_matrix_sync(b0, r0 + k0, q_stride);
-            wmma::load_matrix_sync(b1, r1 + k0, q_stride);
+            wmma::load_matrix_sync(a0, qh0 + k0, head_dim);
+            wmma::load_matrix_sync(a1, qh0 + 16u * head_dim + k0, head_dim);
+            wmma::load_matrix_sync(b0, qh1 + k0, head_dim);
+            wmma::load_matrix_sync(b1, qh1 + 16u * head_dim + k0, head_dim);
             wmma::load_matrix_sync(kb, b_sh + col0 * 136u + k0, 136);
             wmma::mma_sync(c0, a0, kb, c0);
             wmma::mma_sync(c1, a1, kb, c1);
@@ -1099,20 +1109,22 @@ static int indexer_scores_f16q_launch(
     }
     if (n_tokens > 1u && !g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
-        /* Direct-load kernel: a-fragments from global fp16 q, no a_sh
-         * staging, no per-head barriers, two heads interleaved. Measured
-         * 3.65x faster than the staged kernel at 98304 comps x 8192
-         * tokens (1538 -> 421 ms) with bit-identical outputs. The direct
-         * fragment loads read the full 32-token tile, which stays inside
-         * the pc-sized q buffer for any n_tokens <= pc (partial-tile rows
-         * compute garbage that the token guards drop); the weights load is
+        /* Direct-load kernel: a-fragments load straight from the global fp16
+         * q (head-major layout, transposed by the QAT step), no a_sh staging,
+         * no per-head barriers, two heads interleaved. Measured 3.65x faster
+         * than the staged kernel at 98304 comps x 8192 tokens (1538 -> 421 ms,
+         * 31.3 TFLOPS) with bit-identical outputs; the head-major tiles take it
+         * to 33.7 TFLOPS. Handles all n_tokens > 1: partial-tile fragment
+         * loads read in-bounds of the pc-sized q buffer (out-of-range rows
+         * produce garbage that the token guards drop) and the weights load is
          * clamped. */
+        const uint32_t pc = (uint32_t)(q16->bytes / ((uint64_t)n_head * head_dim * sizeof(__half)));
         indexer_scores_wmma128_direct_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                            (const __half *)q16->ptr,
                                                            (const float *)weights->ptr,
                                                            (const float *)index_comp->ptr,
                                                            n_comp, n_tokens, pos0, n_head,
-                                                           head_dim, ratio, scale, 1);
+                                                           head_dim, ratio, scale, 1, pc);
         return cuda_ok(cudaGetLastError(), "indexer scores wmma128 direct f16q launch");
     }
     return 0;
@@ -1754,16 +1766,18 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, NULL, n_rows, head_dim);
+    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, NULL, n_rows, head_dim, 1, n_rows);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
 
-extern "C" int ds4_gpu_dsv4_indexer_qat_f16_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *x16, uint32_t n_rows, uint32_t head_dim) {
-    if (!x || !x16 || n_rows == 0 || head_dim != 128u ||
+extern "C" int ds4_gpu_dsv4_indexer_qat_f16_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *x16, uint32_t n_rows, uint32_t n_head, uint32_t head_dim) {
+    if (!x || !x16 || n_rows == 0 || head_dim != 128u || n_head == 0 ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
         x16->bytes < (uint64_t)n_rows * head_dim * sizeof(__half)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, (__half *)x16->ptr, n_rows, head_dim);
+    const uint32_t token_cap = (uint32_t)(x16->bytes / ((uint64_t)n_head * head_dim * sizeof(__half)));
+    if (token_cap == 0) return 0;
+    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, (__half *)x16->ptr, n_rows, head_dim, n_head, token_cap);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 f16 launch");
 }

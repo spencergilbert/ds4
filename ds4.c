@@ -29036,6 +29036,7 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) ok = ds4_gpu_dsv4_indexer_qat_f16_tensor(metal_graph_batch_indexer_q(g),
                                                                metal_graph_batch_indexer_q_half(g),
                                                                n_tokens * DS4_N_INDEXER_HEAD,
+                                                               DS4_N_INDEXER_HEAD,
                                                                DS4_N_INDEXER_HEAD_DIM) != 0;
             if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
                                                      model->map,
