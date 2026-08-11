@@ -1766,7 +1766,6 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     uint32_t count = counts[expert];
     if (max_count != 0u && count >= max_count) return;
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
     __shared__ uint8_t s_iq2_signs[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1782,19 +1781,9 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-    }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
     for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     __syncthreads();
-    if (xq_blocks <= 16u) {
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
         uint32_t row = blockIdx.x * ROW_SPAN + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -4783,10 +4772,6 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
     half *shBu0 = shBg0 + BK * BN;
     half *shBg1 = shBu0 + BK * BN;
     half *shBu1 = shBg1 + BK * BN;
-    float *shCg0 = reinterpret_cast<float *>(shBu1 + BK * BN);
-    float *shCu0 = shCg0 + MTILES * BM * BN;
-    float *shCg1 = shCu0 + MTILES * BM * BN;
-    float *shCu1 = shCg1 + MTILES * BM * BN;
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
     const uint32_t expert = hot_experts[hot_idx];
@@ -4860,45 +4845,44 @@ __global__ static void moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel(
         __syncthreads();
     }
 
+    /* Register-resident epilogue: rocwmma gfx1151 16x16x16 f32 accumulator
+     * element i of lane l holds (row = 2*i + (l>>4), col = l & 15) of the
+     * 16x16 tile.  Each wave owns its four accumulators, so the shared-memory
+     * C round trip (and its __syncthreads) is eliminated. */
     if (wave < MTILES) {
-        rocwmma::store_matrix_sync(shCg0 + wave * BM * BN, accg0, BN, rocwmma::mem_row_major);
-        rocwmma::store_matrix_sync(shCu0 + wave * BM * BN, accu0, BN, rocwmma::mem_row_major);
-        rocwmma::store_matrix_sync(shCg1 + wave * BM * BN, accg1, BN, rocwmma::mem_row_major);
-        rocwmma::store_matrix_sync(shCu1 + wave * BM * BN, accu1, BN, rocwmma::mem_row_major);
-    }
-    __syncthreads();
-
-    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
-        const uint32_t mt = j / (BM * BN);
-        const uint32_t rem = j - mt * BM * BN;
-        const uint32_t mm = rem / BN;
-        const uint32_t nn = rem - mm * BN;
-        const uint32_t pair = shPair[mt * BM + mm];
-        if (pair != UINT32_MAX) {
-            const uint32_t row0 = n0 + nn;
-            const uint32_t row1 = n0 + BN + nn;
-            const float wt = weights[pair];
-            if (row0 < expert_mid_dim) {
-                float g = shCg0[j], u = shCu0[j];
-                if (clamp > 1.0e-6f) {
-                    if (g > clamp) g = clamp;
-                    if (u > clamp) u = clamp;
-                    if (u < -clamp) u = -clamp;
+        const uint32_t lane_w = tid & 31u;
+        const uint32_t mt = wave;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint32_t m_idx = 2u * (uint32_t)i + (lane_w >> 4u);
+            const uint32_t n_idx = lane_w & 15u;
+            const uint32_t pair = shPair[mt * BM + m_idx];
+            if (pair != UINT32_MAX) {
+                const uint32_t row0 = n0 + n_idx;
+                const uint32_t row1 = n0 + BN + n_idx;
+                const float wt = weights[pair];
+                if (row0 < expert_mid_dim) {
+                    float g = accg0.x[i], u = accu0.x[i];
+                    if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
+                        if (u > clamp) u = clamp;
+                        if (u < -clamp) u = -clamp;
+                    }
+                    const float v = moe_silu_oldhip(g) * u * wt;
+                    if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
+                    else mid_out[(uint64_t)pair * expert_mid_dim + row0] = v;
                 }
-                const float v = moe_silu_oldhip(g) * u * wt;
-                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row0] = __float2half(v);
-                else mid_out[(uint64_t)pair * expert_mid_dim + row0] = v;
-            }
-            if (row1 < expert_mid_dim) {
-                float g = shCg1[j], u = shCu1[j];
-                if (clamp > 1.0e-6f) {
-                    if (g > clamp) g = clamp;
-                    if (u > clamp) u = clamp;
-                    if (u < -clamp) u = -clamp;
+                if (row1 < expert_mid_dim) {
+                    float g = accg1.x[i], u = accu1.x[i];
+                    if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
+                        if (u > clamp) u = clamp;
+                        if (u < -clamp) u = -clamp;
+                    }
+                    const float v = moe_silu_oldhip(g) * u * wt;
+                    if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
+                    else mid_out[(uint64_t)pair * expert_mid_dim + row1] = v;
                 }
-                const float v = moe_silu_oldhip(g) * u * wt;
-                if (OUT_F16) mid_out_h[(uint64_t)pair * expert_mid_dim + row1] = __float2half(v);
-                else mid_out[(uint64_t)pair * expert_mid_dim + row1] = v;
             }
         }
     }
@@ -5165,8 +5149,6 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shB0 = shA + MTILES * BM * BK;
     half *shB1 = shB0 + BK * BN;
-    float *shC0 = reinterpret_cast<float *>(shB1 + BK * BN);
-    float *shC1 = shC0 + MTILES * BM * BN;
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
     const uint32_t expert = hot_experts[hot_idx];
@@ -5238,42 +5220,43 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         __syncthreads();
     }
 
+    /* Register-resident epilogue (same gfx1151 accumulator layout as the
+     * gate/up kernel): element i of lane l holds (row = 2*i + (l>>4),
+     * col = l & 15).  Removes the shared-memory C round trip. */
     if (wave < MTILES) {
-        rocwmma::store_matrix_sync(shC0 + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
-        rocwmma::store_matrix_sync(shC1 + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
-    }
-    __syncthreads();
-    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
-        const uint32_t mt = j / (BM * BN);
-        const uint32_t rem = j - mt * BM * BN;
-        const uint32_t mm = rem / BN;
-        const uint32_t nn = rem - mm * BN;
-        const uint32_t pair = shPair[mt * BM + mm];
-        if (pair != UINT32_MAX) {
-            const uint32_t row0 = n0 + nn;
-            const uint32_t row1 = n0 + BN + nn;
-            const uint32_t tok = pair / n_expert;
-            const uint32_t slot = pair - tok * n_expert;
-            if (row0 < out_dim) {
-                if (OUT_F16) {
-                    uint64_t dst = (uint64_t)pair * out_dim + row0;
-                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
-                    down_out_h[dst] = __float2half(shC0[j]);
-                } else {
-                    uint64_t dst = (uint64_t)pair * out_dim + row0;
-                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
-                    down_out[dst] = shC0[j];
+        const uint32_t lane_w = tid & 31u;
+        const uint32_t mt = wave;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint32_t m_idx = 2u * (uint32_t)i + (lane_w >> 4u);
+            const uint32_t n_idx = lane_w & 15u;
+            const uint32_t pair = shPair[mt * BM + m_idx];
+            if (pair != UINT32_MAX) {
+                const uint32_t row0 = n0 + n_idx;
+                const uint32_t row1 = n0 + BN + n_idx;
+                const uint32_t tok = pair / n_expert;
+                const uint32_t slot = pair - tok * n_expert;
+                if (row0 < out_dim) {
+                    if (OUT_F16) {
+                        uint64_t dst = (uint64_t)pair * out_dim + row0;
+                        if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
+                        down_out_h[dst] = __float2half(acc0.x[i]);
+                    } else {
+                        uint64_t dst = (uint64_t)pair * out_dim + row0;
+                        if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
+                        down_out[dst] = acc0.x[i];
+                    }
                 }
-            }
-            if (row1 < out_dim) {
-                if (OUT_F16) {
-                    uint64_t dst = (uint64_t)pair * out_dim + row1;
-                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
-                    down_out_h[dst] = __float2half(shC1[j]);
-                } else {
-                    uint64_t dst = (uint64_t)pair * out_dim + row1;
-                    if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
-                    down_out[dst] = shC1[j];
+                if (row1 < out_dim) {
+                    if (OUT_F16) {
+                        uint64_t dst = (uint64_t)pair * out_dim + row1;
+                        if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
+                        down_out_h[dst] = __float2half(acc1.x[i]);
+                    } else {
+                        uint64_t dst = (uint64_t)pair * out_dim + row1;
+                        if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
+                        down_out[dst] = acc1.x[i];
+                    }
                 }
             }
         }
