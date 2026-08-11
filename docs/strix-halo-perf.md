@@ -105,6 +105,63 @@ See commit `0bccfdd` on branch `fedora44-ds4`.
 | Arena span limit | `rocm/ds4_rocm_runtime.cuh` | `total/3` → `total*3/4` for SSD streaming headroom |
 | Managed KV reserve | `rocm/ds4_rocm_runtime.cuh`, `ds4_cuda.cu` | `total/4` → `total/8` so more contexts keep device KV |
 
+## Max Usable Context: 512K → 1M (2026-08-11)
+
+The resident model (80.76 GiB) plus session buffers used to cap at ~512K
+ctx: 768K/1M OOM'd at session create with 14 `ROCm tensor alloc failed`
+errors. The planned-memory print (92.47 GiB at 384K) understated the real
+usage — measured with `DS4_METAL_MEMORY_REPORT=1` (now printed at session
+create too), the model load ends at 97.57 GiB used (model 80.76 + q8→fp16
+acceleration cache 10.58 + driver/arena overhead) and the session adds
+~29.4 KiB/token at pc=8192.
+
+Session marginal cost at pc=8192 (measured slope, 21 ratio-4 layers):
+
+| component | KiB/token | note |
+|---|---|---|
+| attn-compressed KV (fp32) | 10.5 | `DS4_GPU_ATTN_COMP_CACHE_F16` is 0 off-Apple |
+| indexer-scores scratch | 8.0 | `comp_cap x pc` fp32 |
+| comp_mask scratch | 8.0 | `comp_cap x pc` fp32 — **only col 0 ever used** |
+| index-comp cache (fp32) | 2.6 | feeds the score kernel |
+| attn-comp r128 (fp32) | 0.3 | |
+
+Two bit-exact fixes in `ds4.c`:
+
+1. **comp_mask `comp_cap x pc` → `comp_cap x 1` float.** The batched prefill
+   path runs the indexed attention kernel (comp_selected, no mask); the
+   batched decode-mixed path never receives a mask (`use_comp_mask` is only
+   set alongside `use_indexed_comp`); only the per-token fallback and decode
+   scratch read it, at column 0. Logits **bit-identical** (0/129280 diffs at
+   16K and 64K vs the pre-change binary). Saves 4.3 GiB @512K, 6.4 @768K,
+   8.6 @1M.
+2. **Prefill chunk 8192 → 4096 for ctx > 512K.** Halves the indexer-scores
+   buffer and the batch-HC buffers (~5.2 GiB @1M). Costs ~5-6% prefill on
+   runs that are already indexer-bound. The 8192 default is unchanged at
+   <=512K (64K prefill tps within noise, logits bit-identical). The
+   4096-vs-8192 chunk logit difference is **pre-existing**: the raw SWA cache
+   holds the whole current ubatch raw, so the chunk size sets the
+   uncompressed attention window (verified the old binary produces the
+   identical max-delta 3.24 at 16K).
+
+Measured memory (session create):
+
+| ctx | pc | used | free | status |
+|---|---|---|---|---|
+| 512K | 8192 | ~114.3 GiB | ~7.4 GiB | OK |
+| 768K | 8192 (explicit) | 122.25 GiB | 1.75 GiB | OK, tight |
+| 768K | 4096 (auto) | 114.98 GiB | 9.02 GiB | OK |
+| 1M | 4096 (auto) | 119.34 GiB | 4.66 GiB | OK (was OOM) |
+
+Measured throughput (new binary): 64K frontier prefill 209.9 t/s @768K
+session, 205.3 t/s @1M; decode 14.7 t/s @768K, 14.4 t/s @1M (unchanged
+from the 13-16 t/s baseline). Full-prompt prefill at 512K+ is indexer-bound
+(linear in n_comp): at 384K full-prompt is 124.7 t/s (54 min); 512K ≈
+95 t/s (~1.5 h), 768K ≈ 64 t/s (~3.3 h), 1M ≈ 48 t/s (~6 h) estimated from
+the per-chunk cost model. CSV: `speed-bench/strix_halo_maxctx.csv`.
+
+The managed-KV decision now also flips later (the estimate shrank):
+384K sessions may stay device-resident instead of managed.
+
 ## SSD Streaming at Large Contexts
 
 Extensive testing with various expert cache sizes (8–69 GiB) at 384K–1M ctx:
@@ -190,6 +247,7 @@ vs ~1.1 s for indexer scores at 384K).
 | `DS4_PREFILL_CHUNK` | 4096 | tokens per GPU prefill chunk |
 | `DS4_ROCM_INDEXER_STAGE_PROFILE` | (unset) | per-layer indexer score/topk/attention timing |
 | `DS4_ROCM_LAYER_STAGE_PROFILE[_LAYER]` | (unset) | per-layer prefill stage timing |
+| `DS4_METAL_MEMORY_REPORT` | (unset) | print used/free GPU memory after model load and after session create |
 
 ## Validation Plan (indexer kernel rewrite)
 

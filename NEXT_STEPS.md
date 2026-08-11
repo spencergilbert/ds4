@@ -9,7 +9,35 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
 
 ## What's Done
 
-0. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
+0. **Max usable context 512K → 1M (DONE 2026-08-11)** — the model's full
+   `context_length` (1M) now creates a session and prefills on Strix Halo. The
+   previous ceiling was ~512K (768K/1M OOM'd at session create). Two bit-exact
+   memory-budget changes in `ds4.c` (measurements via
+   `DS4_METAL_MEMORY_REPORT=1`, added to the session-create path):
+   - **comp_mask scratch shrink**: the `comp_cap x pc` fp32 mask buffer is only
+     consumed per-token — the batched prefill path runs the indexed attention
+     kernel (which takes `comp_selected`, not the mask), the batched
+     decode-mixed path never receives a mask (`use_comp_mask` is only set
+     alongside `use_indexed_comp`), and the per-token fallback / decode scratch
+     read column 0 only. Sized it `comp_cap x 1` float. Saves 4.3 GiB @512K,
+     6.4 GiB @768K, 8.6 GiB @1M. **Bit-identical** logits (0/129280 diffs at
+     16K and 64K vs the pre-change binary; the launch-side `n_tokens x n_comp`
+     byte checks still gate any future batch-mask use).
+   - **Prefill chunk 8192 → 4096 for ctx > 512K**: the per-chunk indexer-scores
+     buffer (`comp_cap x pc`) halves (another ~4.3 GiB @1M), and the batch-HC
+     buffers shrink too. Costs ~5-6% prefill on runs that are already
+     indexer-bound at these lengths; the 8192 default is unchanged at <=512K
+     (no regression: 64K prefill tps within noise, logits bit-identical). Note
+     the 4096-vs-8192 chunk logit difference is **pre-existing** engine
+     behavior (the raw SWA cache holds the whole current ubatch raw, so the
+     chunk size sets the uncompressed attention window; verified the old binary
+     produces the identical max-delta 3.24 at 16K).
+   Measured (new binary): 768K session used=122.25 GiB / free=1.75 GiB
+   (8192 chunks, explicit) or 114.98 / 9.02 (auto 4096); 1M used=119.34 /
+   free=4.66 (auto 4096). Prefill 64K frontier at 768K/1M sessions:
+   209.9/205.3 t/s; decode 14.7/14.4 t/s. CSV: `speed-bench/strix_halo_maxctx.csv`.
+
+1. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
    biggest per-layer cost (~43-49%); for agentic turn prefill (small token
    batches) the scalar cold-expert path dominated at ~1.8-2.6 TFLOPS. Three
    bit-exact changes in `rocm/ds4_rocm_moe.cuh`/`_launch.cuh`:
@@ -39,7 +67,8 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
 3. **Extensive testing** of SSD streaming at 384K–1M ctx with various cache sizes
    (see `docs/strix-halo-perf.md`). Ceiling is ~56 GB expert cache at 512K ctx,
    ~67 GB at 512K. Auto budget (69 GiB) OOMs the arena. All streaming at >64K
-   thrashes (26–415× read amplification from q8-fp16 cache churn).
+   thrashes (26–415× read amplification from q8-fp16 cache churn). **SSD streaming
+   is now unnecessary for DeepSeek up to 1M** — the resident session fits.
 
 ## The 64K Context Cliff Is NOT Reproducible (as described)
 
@@ -174,6 +203,34 @@ memory-side gain.
   kernel, not FA).
 - 384K confirmation run.
 
+## Max-Context Memory Budget (2026-08-11)
+
+Measured with `DS4_METAL_MEMORY_REPORT=1` (now also printed at session
+create). The session's per-token marginal cost is ~29.4 KiB/token at
+pc=8192, dominated by: attn-compressed KV fp32 (10.5), indexer-scores
+scratch (8), comp_mask scratch (8), index-comp fp32 (2.6). The old
+`comp_cap x pc` comp_mask was **dead weight** (only column 0 is ever
+consumed). After the two fixes the marginal cost is ~17.4 KiB/token:
+
+| ctx | pc | used after session | free | status |
+|---|---|---|---|---|
+| 512K | 8192 | ~114.3 GiB | ~7.4 GiB | OK (was 3.1) |
+| 768K | 8192 (explicit) | 122.25 GiB | 1.75 GiB | OK, tight |
+| 768K | 4096 (auto) | 114.98 GiB | 9.02 GiB | OK |
+| 1M | 4096 (auto) | 119.34 GiB | 4.66 GiB | OK (was OOM) |
+| 1M | 8192 | — | — | OOM (short ~0.6 GiB) |
+
+Remaining levers if headroom is ever needed again (all would change logits
+slightly except the first):
+- **fp16 compressed KV** (Metal already stores the attn-comp cache fp16;
+  the ROCm attention kernels currently reject `comp_kv_f16`, so this needs
+  fp16-read support in the 4 attention kernels): −5.25 GiB @1M.
+- **fp16 index_comp cache**: −1.3 GiB @1M (score inputs change).
+- **fp16 indexer-scores buffer**: −4.1 GiB @1M (top-k rank can flip near
+  the boundary).
+- **q8→fp16 cache partial yield** at session create: up to −10.6 GiB but
+  prefill drops toward 148 t/s (measured −41% with the cache disabled).
+
 ### Not needed
 
 - FlashAttention HIP kernel (Priority 2 of the old plan): attention is
@@ -197,6 +254,14 @@ rm -f /tmp/ds4.lock  # if stale
 DS4_ROCM_INDEXER_STAGE_PROFILE=1 DS4_ROCM_LAYER_STAGE_PROFILE=1 \
 DS4_ROCM_LAYER_STAGE_PROFILE_LAYER=0 ./ds4-bench -m <model> \
   --prompt-file /tmp/promessi_x6.txt --ctx-start 65536 --ctx-max 65536 --gen-tokens 0
+
+# Memory-budget diagnosis (used / free after model load and after session):
+DS4_METAL_MEMORY_REPORT=1 ./ds4-bench -m <model> --prompt-file /tmp/promessi_x6.txt \
+  --ctx-start 2048 --ctx-max 2048 --ctx-alloc 1048576 --gen-tokens 0
+
+# Max-context smoke (1M session, 2 frontiers, ~1 min after model load):
+./ds4-bench -m <model> --prompt-file /tmp/promessi_x6.txt \
+  --ctx-start 2048 --ctx-max 2048 --ctx-alloc 1048576 --gen-tokens 0
 
 # Do NOT run two ds4 processes concurrently — single instance lock.
 # Kill with: pkill -9 -f ds4-bench; rm -f /tmp/ds4.lock

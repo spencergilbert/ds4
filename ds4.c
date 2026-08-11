@@ -12174,10 +12174,24 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
             }
         } else if (prompt_len > 4096) {
 #ifdef DS4_ROCM_BUILD
-            /* ROCm (Strix Halo): 8192-token chunks measured 5-6% faster
-             * prefill than 4096 (better GEMM utilization, fewer launches).
-             * The raw SWA cache grows to match (raw_kv_rows=8192). */
-            cap = 8192u;
+            if (prompt_len > 512 * 1024) {
+                /* Very long contexts (>=512K): drop to a 4096-token chunk so
+                 * the per-chunk scratch (indexer scores buffer, batch HC) stays
+                 * inside the ~121 GiB GTT budget. 8192-token chunks would need
+                 * ~4-5 GiB more and OOM session create past ~768K. The smaller
+                 * chunk costs ~5-6% prefill on runs that are already
+                 * indexer-bound at these lengths. Note the 4096-vs-8192 chunk
+                 * logit difference is pre-existing engine behavior (the raw SWA
+                 * cache holds the whole current ubatch raw, so the chunk size
+                 * sets the uncompressed attention window); there is no 8192
+                 * alternative at >=512K (it does not fit). */
+                cap = 4096u;
+            } else {
+                /* ROCm (Strix Halo): 8192-token chunks measured 5-6% faster
+                 * prefill than 4096 (better GEMM utilization, fewer launches).
+                 * The raw SWA cache grows to match (raw_kv_rows=8192). */
+                cap = 8192u;
+            }
 #else
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
 #endif
@@ -16166,7 +16180,7 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     const uint64_t kv_cache_bytes = metal_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
-                     2ull * comp_cap * prefill_cap * sizeof(float);
+                     (comp_cap * prefill_cap + comp_cap) * sizeof(float);
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
@@ -17027,6 +17041,9 @@ static bool metal_graph_alloc_raw_cap(
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
     const bool managed_kv_cache =
         ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+        ds4_gpu_print_memory_report("graph alloc begin");
+    }
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -17231,7 +17248,14 @@ static bool metal_graph_alloc_raw_cap(
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
         g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
-        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        /* comp_mask is only consumed per-token: the batched prefill path uses
+         * the indexed attention kernel (comp_selected), the batched decode-mixed
+         * path never receives a mask (use_comp_mask is only set alongside
+         * use_indexed_comp), and the per-token fallback / decode scratch read
+         * column 0 only. Size it comp_cap x 1 float instead of comp_cap x pc:
+         * saves 4.3-8.6 GiB at 512K-1M context (bit-exact; the launch-side
+         * n_tokens x n_comp byte checks still gate any future batch-mask use). */
+        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * sizeof(float));
         g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                 (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t));
         g->heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
@@ -36469,9 +36493,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
-        m.scratch_bytes = 2ull *
-                          m.comp_cap *
-                          m.prefill_cap *
+        /* indexer_scores stays comp_cap x prefill_cap (fully used by the
+         * top-k pass); comp_mask is per-token only (comp_cap x 1 float). */
+        m.scratch_bytes = (m.comp_cap * m.prefill_cap + m.comp_cap) *
                           sizeof(float) +
                           attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
     } else {
@@ -49254,7 +49278,7 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     total += indexer_q_dim * sizeof(float);                /* indexer_q_by_tier */
     total += (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float); /* indexer_weights_by_tier */
     total += (uint64_t)comp_cap * pc * sizeof(float);      /* indexer_scores_by_tier */
-    total += (uint64_t)comp_cap * pc * sizeof(float);      /* comp_mask_by_tier */
+    total += (uint64_t)comp_cap * sizeof(float);           /* comp_mask_by_tier (per-token) */
     const uint64_t top_k =
         (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u);
     total += top_k * pc * sizeof(uint32_t);                /* comp_selected_by_tier */
@@ -58937,6 +58961,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     {
         free(s);
         return 1;
+    }
+    if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+        ds4_gpu_print_memory_report("session graph alloc done");
     }
     if (e->share_session_prefill_workspace &&
         !e->shared_prefill_workspace_ready) {
