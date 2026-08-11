@@ -71,6 +71,12 @@ prefill chunk default):**
 
 ## Remaining Cost Profile (8192-token chunks, layer 0 at 64K tail)
 
+**Update 2026-08-11 (indexer direct-load kernel):** the score stage at the
+64K tail dropped 181 → 61 ms/layer; the balance is now top-k 49 ms and
+indexed attention 216 ms (flat in ctx), so the score kernel is no longer the
+long-context bottleneck. See the indexer kernel section below for the new
+prefill sweep.
+
 | stage | ms/8192-token layer | share |
 |---|---|---|
 | routed MoE (iq2/q2k kernels) | ~298 | ~43% |
@@ -94,6 +100,45 @@ gate (xq via L2, row span 1024→256) are bit-exact and cut the MoE:
 - scalar gate 22.7 → 15.3 ms/layer at 200 tokens
 End-to-end prefill +5-6% at 2K-64K (195.8→206.5 at 2K, 236.5→251.3 at 8K,
 205.3→218.5 at 64K), +2.6-3% at 128K-384K; decode unchanged.
+
+## Indexer Scores Kernel: Direct-Load (2026-08-11)
+
+`indexer_scores_wmma128_kernel_t` was issue/latency-bound at ~8.5 TFLOPS:
+**every block staged the fp16 q through `a_sh` shared memory and hit 64
+per-head `__syncthreads()` barriers**. Replaced with a direct-load kernel
+(`indexer_scores_wmma128_direct_kernel` in `rocm/ds4_rocm_indexer.cuh`):
+
+- a-fragments load straight from the global fp16 q (row stride
+  `n_head*head_dim`) — no a_sh staging, **zero barriers** in the head loop
+- two heads interleaved per iteration (4 accumulator pairs in flight); the
+  4-head variant spills registers and is 10x slower
+- weights preloaded to shared once; `b_sh` (fp16 index_comp) unchanged
+- causal mask, fully-masked early-out, and accumulation order unchanged
+
+Measured (micro-bench, `98304 comps x 8192 tokens`): 1538 → 421 ms
+(8.6 → 31.3 TFLOPS; MMA-only ceiling ~43 TFLOPS). Breakdown experiments:
+barriers cost ~9%, the ReLU epilogue ~7%, the a_sh staging + barrier
+serialization ~55% — removing the staging is the win. **Bit-identical**
+logits at 16K (including a 16-token partial-tile tail chunk) and 64K
+(0/129280 diffs). The direct kernel handles all n_tokens > 1 (partial tiles
+read in-bounds of the pc-sized q buffer; out-of-range rows are dropped by
+the token guards; weights loads are clamped); the fp32-q staged kernel
+remains as the fallback.
+
+End-to-end prefill (8192-token chunks, full-prompt):
+
+| ctx | before | after | Δ |
+|---|---|---|---|
+| 8K | 251.2 | 252.7 | +0.6% |
+| 32K | 237.3 | 243.0 | +2.4% |
+| 64K | 219.3 | 229.4 | +4.6% |
+| 128K | 185.5 | 201.0 | +8.3% |
+| 384K | 124.7 | 142.7 | +14.5% (54 → 46 min) |
+
+Decode unchanged (~13 t/s). The remaining long-context indexer costs are
+the top-k CUB tree (49 ms at 64K tail, ~230 ms at 384K) and the indexed
+attention (216 ms per 8192-token chunk, flat in ctx) — both now larger
+than the score stage. CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`.
 
 ## Code Fixes Applied
 

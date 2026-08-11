@@ -9,7 +9,33 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
 
 ## What's Done
 
-0. **Max usable context 512K → 1M (DONE 2026-08-11)** — the model's full
+0. **Indexer scores kernel 3.65× (DONE 2026-08-11)** — the prefill score
+   stage (`indexer_scores_wmma128_kernel_t`) was issue/latency-bound at
+   ~8.5 TFLOPS: every block staged the fp16 q through `a_sh` shared memory
+   and hit 64 per-head `__syncthreads()` barriers. Rewrote it as a
+   direct-load kernel (`indexer_scores_wmma128_direct_kernel` in
+   `rocm/ds4_rocm_indexer.cuh`):
+   - a-fragments load straight from the global fp16 q (row stride
+     `n_head*head_dim`) — no a_sh staging, no barriers
+   - two heads interleaved per iteration for MMA ILP (4 accumulator pairs
+     in flight; 4-head spills registers and is 10x slower)
+   - weights preloaded to shared once; `b_sh` (fp16 index_comp) staged as
+     before; causal mask and fully-masked early-out unchanged
+   Micro-bench (`/tmp/idxbench3/6/7.cu`): 1538 → 421 ms at 98304 comps ×
+   8192 tokens (8.6 → 31.3 TFLOPS; MMA-only ceiling ~43). **Bit-identical**
+   logits at 16K (incl. a 16-token partial-tile tail chunk), 64K (0/129280
+   diffs vs the pre-change binary). The direct kernel is used for all
+   n_tokens > 1 (partial tiles read in-bounds of the pc-sized q buffer;
+   out-of-range rows compute garbage that the token guards drop; weights
+   loads are clamped).
+   End-to-end prefill (8192-token chunks): 8K 251.2→252.7, 32K 237.3→243.0,
+   64K 219.3→229.4 (+4.6%), 128K 185.5→201.0 (+8.3%), 384K 124.7→142.7
+   (+14.5%, 54→46 min). Decode unchanged (~13 t/s). Production stage
+   profile at 64K tail (comp=16384, 8192-token chunk): score 181→61
+   ms/layer; top-k 49 ms, indexed attention 216 ms are now the bigger
+   indexer costs. CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`.
+
+1. **Max usable context 512K → 1M (DONE 2026-08-11, `b210a95`)** — the model's full
    `context_length` (1M) now creates a session and prefills on Strix Halo. The
    previous ceiling was ~512K (768K/1M OOM'd at session create). Two bit-exact
    memory-budget changes in `ds4.c` (measurements via
@@ -37,7 +63,7 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    free=4.66 (auto 4096). Prefill 64K frontier at 768K/1M sessions:
    209.9/205.3 t/s; decode 14.7/14.4 t/s. CSV: `speed-bench/strix_halo_maxctx.csv`.
 
-1. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
+2. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
    biggest per-layer cost (~43-49%); for agentic turn prefill (small token
    batches) the scalar cold-expert path dominated at ~1.8-2.6 TFLOPS. Three
    bit-exact changes in `rocm/ds4_rocm_moe.cuh`/`_launch.cuh`:
@@ -53,18 +79,18 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    32K 224.3→237.3, 64K 205.3→218.5, 128K 179.9→185.5, 384K 121.5→124.7.
    Decode unchanged (13.0 t/s). CSV/SVG: `speed-bench/strix_halo_moe_epi.csv`.
 
-1. **Benchmarks produced** at 64K ctx: `speed-bench/strix_halo.csv` (resident sweep
+3. **Benchmarks produced** at 64K ctx: `speed-bench/strix_halo.csv` (resident sweep
    2K→64K, 157–212 t/s prefill, 13–16 t/s gen) and `speed-bench/strix_halo_ssd.csv`
    (SSD streaming sweep, 50–59 t/s prefill, 10–12 t/s gen). Both have SVGs.
 
-2. **Code fixes committed** (`0bccfdd`):
+4. **Code fixes committed** (`0bccfdd`):
    - Managed KV threshold: removed hard 8 GiB cutoff in `rocm/ds4_rocm_runtime.cuh`
      and `ds4_cuda.cu` — now consults free device memory instead
    - Arena span limit: `total/3` → `total*3/4` in `rocm/ds4_rocm_runtime.cuh`
      for SSD streaming headroom
    - Managed KV reserve: `total/4` → `total/8` so more contexts keep device-resident KV
 
-3. **Extensive testing** of SSD streaming at 384K–1M ctx with various cache sizes
+5. **Extensive testing** of SSD streaming at 384K–1M ctx with various cache sizes
    (see `docs/strix-halo-perf.md`). Ceiling is ~56 GB expert cache at 512K ctx,
    ~67 GB at 512K. Auto budget (69 GiB) OOMs the arena. All streaming at >64K
    thrashes (26–415× read amplification from q8-fp16 cache churn). **SSD streaming
