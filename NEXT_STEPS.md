@@ -9,6 +9,22 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
 
 ## What's Done
 
+0. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
+   biggest per-layer cost (~43-49%); for agentic turn prefill (small token
+   batches) the scalar cold-expert path dominated at ~1.8-2.6 TFLOPS. Three
+   bit-exact changes in `rocm/ds4_rocm_moe.cuh`/`_launch.cuh`:
+   - **Gate/up IQ2 WMMA hotlist**: register-resident epilogue (drop the 16 KB
+     fp32 C-tile shared round trip; per-wave fragment writes via the measured
+     gfx1151 accumulator layout). Shared 20→4 KB, kernel 166→133 ms/layer.
+   - **Down Q2K WMMA hotlist**: same epilogue; 90→76 ms/layer.
+   - **Scalar cold-expert gate (tile8 rowspan)**: drop the 37 KB sxq shared
+     staging (read xq via L2) and row span 1024→256. 200-token gate
+     22.7→15.3 ms/layer (-33%).
+   Logits **bit-identical** at 512/2048/65536 ctx (0/129280 diffs). Prefill
+   t/s: 128 41.7→42.9, 512 125.7→131.7, 2K 195.8→206.5, 8K 236.5→251.3,
+   32K 224.3→237.3, 64K 205.3→218.5, 128K 179.9→185.5, 384K 121.5→124.7.
+   Decode unchanged (13.0 t/s). CSV/SVG: `speed-bench/strix_halo_moe_epi.csv`.
+
 1. **Benchmarks produced** at 64K ctx: `speed-bench/strix_halo.csv` (resident sweep
    2K→64K, 157–212 t/s prefill, 13–16 t/s gen) and `speed-bench/strix_halo_ssd.csv`
    (SSD streaming sweep, 50–59 t/s prefill, 10–12 t/s gen). Both have SVGs.

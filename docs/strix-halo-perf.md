@@ -83,6 +83,18 @@ MoE is ~3.3 TFLOP per 8192-token layer at ~11 TFLOPS effective (2-bit
 weights, custom dequant-in-kernel). Indexer scores + top-k + indexed
 attention together are ~2.4x cheaper than the MoE after the rewrites.
 
+**Update 2026-08-11 (`a8a74d7`):** the MoE is split into WMMA hot-expert
+kernels + scalar cold-expert kernels (hot threshold = 8 pairs per expert,
+so small agentic turns are scalar-dominated at only ~1.8-2.6 TFLOPS).
+Register-resident epilogues on both WMMA hotlist kernels (no fp32 C-tile
+shared round trip; gfx1151 accumulator layout) and a shared-free scalar
+gate (xq via L2, row span 1024→256) are bit-exact and cut the MoE:
+- gate/up IQ2 WMMA 166 → 133 ms/layer
+- down Q2K WMMA 90 → 76 ms/layer
+- scalar gate 22.7 → 15.3 ms/layer at 200 tokens
+End-to-end prefill +5-6% at 2K-64K (195.8→206.5 at 2K, 236.5→251.3 at 8K,
+205.3→218.5 at 64K), +2.6-3% at 128K-384K; decode unchanged.
+
 ## Code Fixes Applied
 
 See commit `0bccfdd` on branch `fedora44-ds4`.
@@ -197,6 +209,7 @@ vs ~1.1 s for indexer scores at 384K).
 ## Commits on `fedora44-ds4`
 
 ```
+a8a74d7 rocm: register-resident MoE WMMA epilogues + faster small-batch gate (bit-exact)
 fd054d2 rocm: fp16 indexer q for prefill scores (bit-exact, ~6% score stage)
 ac9c87a rocm: indexer top-k via CUB radix tree (1.3-1.4x, bit-exact)
 3f74827 rocm: rewrite indexer scores WMMA128 kernel (1.47x, bit-exact)
