@@ -82,7 +82,18 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    tail chunks whose n_comp is 8K-16K). Also: the prefill stage trace stubs
    (`glm_graph_*_prefill_trace_*`) were hardcoded off — now env-gated
    (`DS4_TRACE_INDEXED_PREFILL`, `DS4_TRACE_FULL_PREFILL` + `_ALL`/`_SLOW`).
-0.7 **fp16 compressed-KV cache — plumbing landed, cache stays F32
+0.7 **WMMA occupancy (2 blocks/CU) — ruled out (2026-08-12).** The kernel
+   uses 158 VGPRs -> 1 block/CU (2 blocks need <=128); __launch_bounds__(256,2)
+   spills and faults on this ROCm. Restructured the score GEMM to 4 N-tiles
+   per warp over two 512-comp passes + the V to 2 D-tiles over two 256-dim
+   passes -> 125 VGPRs, 2 blocks/CU, bit-identical logits -- but SLOWER
+   (4112 240.2 vs 242.5, 64K 229.3 vs 234.0): the kernel is MFMA-latency-
+   bound at its 6-tile ILP, not occupancy-bound; halving the per-warp MMA
+   ILP costs more than the doubled occupancy gains. Reverted. The WMMA
+   attention is near its floor; bigger levers are the cross-layer stage
+   overlap (score+topk of layer L+1 overlapping layer L's attention) or the
+   score stage's fp16 index_comp.
+0.8 **fp16 compressed-KV cache — plumbing landed, cache stays F32
    (2026-08-11).** All ROCm attention kernels now accept `comp_kv_f16`
    (the WMMA is templated `<0>/<1>`; the online/decode/fallback/static/
    masked kernels and the cublas kv-pack read fp16 at their sites). The
