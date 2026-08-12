@@ -12186,11 +12186,21 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                  * sets the uncompressed attention window); there is no 8192
                  * alternative at >=512K (it does not fit). */
                 cap = 4096u;
-            } else {
-                /* ROCm (Strix Halo): 8192-token chunks measured 5-6% faster
-                 * prefill than 4096 (better GEMM utilization, fewer launches).
-                 * The raw SWA cache grows to match (raw_kv_rows=8192). */
+            } else if (prompt_len > 256 * 1024) {
+                /* 256K-512K: the 16384-token chunk's per-chunk scratch
+                 * (~4-5 GiB more than 8192) does not fit at 384K (OOM), so
+                 * stay at the 8192 that fits through 512K. */
                 cap = 8192u;
+            } else {
+                /* ROCm (Strix Halo): 16384-token chunks measured ~1.5-1.6%
+                 * faster prefill than 8192 (fewer chunk boundaries/launches;
+                 * 64K 239.5 vs 235.7, 128K 208.9 vs 205.8 t/s). The raw SWA
+                 * cache grows to match (raw_kv_rows=16384). The 16384 chunk
+                 * at 384K+ does not fit the GTT budget (it OOMs), hence the
+                 * 256K ceiling above. The chunk-size logit shift is
+                 * pre-existing engine behavior (max|d|=2.4 at 64K, argmax
+                 * stable). */
+                cap = 16384u;
             }
 #else
             cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
@@ -35918,7 +35928,18 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
     if (wanted > (uint32_t)ctx_size) wanted = (uint32_t)ctx_size;
     if (wanted == 0) wanted = 1;
     wanted = align_up(wanted, 256u);
-    if (wanted > 8192u) wanted = 8192u;
+    if (wanted > 8192u) {
+        if (prefill_cap <= 8192u) {
+            /* Legacy ceiling: with <=8192-token ubatches the ring buffer
+             * never needs more than the 8192-row window (the wrap keeps
+             * the previous chunk's tail in the upper rows). */
+            wanted = 8192u;
+        } else {
+            /* Bigger ubatches (e.g. the 16384-token ROCm prefill chunk)
+             * must fit their own rows; the window wraps within the ring. */
+            wanted = (uint64_t)align_up(prefill_cap, 256u);
+        }
+    }
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
@@ -49022,7 +49043,13 @@ static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     /* align_up to 256 — inline since align_up is defined upstream. */
     const uint64_t align = 256u;
     wanted = (wanted + align - 1u) & ~(align - 1u);
-    if (wanted > 8192u) wanted = 8192u;
+    if (wanted > 8192u) {
+        if (prefill_cap <= 8192u) {
+            wanted = 8192u;
+        } else {
+            wanted = (uint64_t)((prefill_cap + align - 1u) & ~(align - 1u));
+        }
+    }
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
