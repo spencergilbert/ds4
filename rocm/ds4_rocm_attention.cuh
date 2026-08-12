@@ -1263,6 +1263,227 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+namespace wmma = rocwmma;
+#else
+namespace wmma = nvcuda::wmma;
+#endif
+
+/* WMMA two-pass indexed attention: score GEMM -> two-pass softmax -> V GEMM.
+ * Block = 1 token x 16 heads, 256 threads (8 warps), grid (n_tokens,
+ * ceil(n_head/16)).  Design verified in /tmp/attnwmma3.cu (2.2-3.5x the
+ * online kernel in a production-shaped micro-bench, max|d| ~5e-5).
+ * Production deltas vs the bench:
+ *  - A fragments built manually from fp32 q (batch_q_half is NULL on ROCm);
+ *  - softmax max is a real max-reduce (the bench's sum-of-partial-maxes
+ *    underflows to 0 for the wide real score range -> NaN weights);
+ *  - weights zero-filled over the full 768 comps (production n_score is not
+ *    a multiple of 16 -> partial V tiles would read garbage);
+ *  - V B-fragment gather guards comp < n_score;
+ *  - production row construction: windowed raw rows with ring offsets,
+ *    topk comp rows filtered by -1s and the compression visibility ratio.
+ */
+__global__ static void attention_indexed_mixed_heads16_wmma_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+#if __HIP_DEVICE_COMPILE__ || defined(__CUDA_ARCH__)
+    const uint32_t t = blockIdx.x;
+    const uint32_t hg = blockIdx.y;
+    if (t >= n_tokens || head_dim != 512u) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t h0 = hg * 16u;
+    if (h0 >= n_head) return;
+
+    __shared__ __half sw[16u * 768u];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ uint32_t comp_count_s;
+
+    const uint32_t qpos = pos0 + t;
+    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        comp_count_s = 0;
+        if (n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0 && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+        for (uint32_t i = 0;
+             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
+            const int32_t ci = topk[(uint64_t)t * top_k + i];
+            if (ci < 0) continue;
+            const uint32_t c = (uint32_t)ci;
+            if (c < n_comp && c < visible_comp) comp_rows[comp_count_s++] = c;
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x)
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    __syncthreads();
+
+    const uint32_t comp_count = comp_count_s;
+    const uint32_t n_score = raw_count + comp_count;
+    const uint32_t n_pad = (n_score + 15u) & ~15u;
+    const float scale = rsqrtf((float)head_dim);
+
+    /* pass 1: score GEMM C[16][n_pad] += A[16][512] x kv^T[512][n_pad]. */
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cacc[6];
+#pragma unroll
+    for (uint32_t i = 0; i < 6u; i++) wmma::fill_fragment(cacc[i], 0.0f);
+    for (uint32_t k0 = 0; k0 < 512u; k0 += 16u) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af;
+#pragma unroll
+        for (uint32_t e = 0; e < 8u; e++) {
+            const uint32_t m = lane & 15u;
+            const uint32_t k = e + 8u * (lane >> 4u);
+            const uint32_t hm = h0 + m;
+            af.x[e] = hm < n_head
+                ? __float2half(q[((uint64_t)t * n_head + hm) * head_dim + k0 + k])
+                : __half(0.0f);
+        }
+        for (uint32_t i = 0; i < 6u; i++) {
+            const uint32_t n0 = (warp * 6u + i) * 16u;
+            if (n0 >= n_pad) break;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> bf;
+#pragma unroll
+            for (uint32_t e = 0; e < 8u; e++) {
+                const uint32_t dim = k0 + e + 8u * (lane >> 4u);
+                const uint32_t comp = n0 + (lane & 15u);
+                float v = 0.0f;
+                if (comp < n_score) {
+                    const uint32_t r = comp < raw_count
+                        ? raw_rows[comp] : comp_rows[comp - raw_count];
+                    v = comp < raw_count
+                        ? raw_kv[(uint64_t)r * head_dim + dim]
+                        : comp_kv[(uint64_t)r * head_dim + dim];
+                }
+                bf.x[e] = __float2half(v);
+            }
+            wmma::mma_sync(cacc[i], af, bf, cacc[i]);
+        }
+    }
+    for (uint32_t i = 0; i < 6u; i++) {
+        const uint32_t n0 = (warp * 6u + i) * 16u;
+        if (n0 >= n_pad) break;
+        for (uint32_t e = 0; e < 8u; e++) {
+            const uint32_t hh = 2u * e + (lane >> 4u);
+            const uint32_t cc = n0 + (lane & 15u);
+            sw[hh * 768u + cc] = __float2half(cacc[i].x[e] * scale);
+        }
+    }
+    __syncthreads();
+
+    /* pass 2: two-pass softmax, 2 heads per warp, seeded by the sinks. */
+    for (uint32_t hh = 0; hh < 2u; hh++) {
+        const uint32_t h = warp * 2u + hh;
+        if (h >= 16u) break;
+        const uint32_t hrow = h0 + h;
+        float m = -INFINITY;
+        for (uint32_t c = lane; c < n_score; c += 32u)
+            m = fmaxf(m, __half2float(sw[h * 768u + c]));
+        /* the warp butterfly leaves the true result only in lane 0 (lanes
+         * 16-31 double their segment on out-of-range shfl_down sources);
+         * broadcast lane 0 like the online kernels do. */
+        m = warp_max_f32(m);
+        m = __shfl_sync(FULL_WARP_MASK, m, 0);
+        m = fmaxf(m, hrow < n_head ? sinks[hrow] : -INFINITY);
+        float ssum = 0.0f;
+        for (uint32_t c = lane; c < n_score; c += 32u)
+            ssum += expf(__half2float(sw[h * 768u + c]) - m);
+        ssum = warp_sum_f32(ssum);
+        ssum = __shfl_sync(FULL_WARP_MASK, ssum, 0);
+        ssum += hrow < n_head ? expf(sinks[hrow] - m) : 0.0f;
+        const float inv_s = ssum == 0.0f ? 0.0f : 1.0f / ssum;
+        /* full-range pass: real weights for c < n_score, explicit zeros for
+         * the padded comps (the V's partial tile reads them). */
+        for (uint32_t c = lane; c < 768u; c += 32u) {
+            if (c < n_score)
+                sw[h * 768u + c] =
+                    __float2half(expf(__half2float(sw[h * 768u + c]) - m) * inv_s);
+            else
+                sw[h * 768u + c] = __half(0.0f);
+        }
+    }
+    __syncthreads();
+
+    /* pass 3: V GEMM out[16][512] = w[16][n_pad] x kv[n_pad][512]. */
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[4];
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) wmma::fill_fragment(oacc[i], 0.0f);
+    for (uint32_t c0 = 0; c0 < n_score; c0 += 16u) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af;
+        wmma::load_matrix_sync(af, sw + c0, 768u);
+        for (uint32_t i = 0; i < 4u; i++) {
+            const uint32_t d0 = (warp * 4u + i) * 16u;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> bf;
+#pragma unroll
+            for (uint32_t e = 0; e < 8u; e++) {
+                const uint32_t comp = c0 + e + 8u * (lane >> 4u);
+                const uint32_t dim = d0 + (lane & 15u);
+                float v = 0.0f;
+                if (comp < n_score) {
+                    const uint32_t r = comp < raw_count
+                        ? raw_rows[comp] : comp_rows[comp - raw_count];
+                    v = comp < raw_count
+                        ? raw_kv[(uint64_t)r * head_dim + dim]
+                        : comp_kv[(uint64_t)r * head_dim + dim];
+                }
+                bf.x[e] = __float2half(v);
+            }
+            wmma::mma_sync(oacc[i], af, bf, oacc[i]);
+        }
+    }
+    float *out = heads + ((uint64_t)t * n_head + h0) * head_dim;
+    for (uint32_t i = 0; i < 4u; i++) {
+        const uint32_t d0 = (warp * 4u + i) * 16u;
+        for (uint32_t e = 0; e < 8u; e++) {
+            const uint32_t hh = 2u * e + (lane >> 4u);
+            const uint32_t dd = d0 + (lane & 15u);
+            if (h0 + hh < n_head)
+                out[(uint64_t)hh * head_dim + dd] = oacc[i].x[e];
+        }
+    }
+#endif
+}
+
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,

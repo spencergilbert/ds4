@@ -41,9 +41,38 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    ms/layer; top-k 49 ms, indexed attention 216 ms are now the bigger
    indexer costs (both probed in `/tmp/attnbench*`/`/tmp/topkbench*`:
    attention is reduction-bound at its online-softmax floor — the 5-shuffle
-   warp reduction per row; a WMMA two-pass rewrite is the remaining big win
-   but needs fp16 q/kv so logits would change; the top-k 32-bit-key radix
-   idea is blocked by score+index needing ~50 bits). CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`.
+   warp reduction per row; the top-k 32-bit-key radix
+   idea is blocked by score+index needing ~50 bits). CSV/SVG:
+   `speed-bench/strix_halo_idx_direct.csv` (online) and
+   `speed-bench/strix_halo_wmma.csv` (WMMA two-pass, item 0.5).
+
+0.5 **Indexed attention WMMA two-pass rewrite — DONE 2026-08-11.**
+   `attention_indexed_mixed_heads16_wmma_kernel` replaces the online kernel on
+   the fast path (`!g_quality_mode`, `n_head<=64`, `top_k<=512`): block = 1
+   token × 16 heads, 256 threads (8 warps), grid (n_tokens, n_head/16).
+   Score GEMM C[16][n_pad] = fp16 q/kv (A built manually from the fp32 q
+   buffer — `batch_q_half` is NULL on ROCm) with fp32 accumulators → two-pass
+   softmax (seeded by sinks, warp-max + broadcast) → V GEMM from shared fp16
+   weights. fp16 scores/weights are the first intentional logit change;
+   heads match a CPU fp16 model at 3e-4, end-to-end logits are argmax-stable
+   (top-5 identical, top-5 prob mass 0.9932 vs 0.9937; mean logit delta
+   0.32 is the 43-layer accumulation of the fp16 change). The topk sort is
+   skipped (order-independent two-pass softmax).
+   - **performance**: 4112 239.0→242.8, 64K 229.4→233.0, 128K 202.4→205.8
+     (+1.6-1.7%); the attention stage itself drops ~2.4× (216→~90 ms/layer
+     at the 64K tail) but n_score is capped at 640 (top_k 512 + 128 raw) so
+     the attention is already a minority of the per-chunk time.
+   - the last-session "race" in the weights was a **missing lane-0 broadcast**
+     after `warp_sum_f32`/`warp_max_f32`: the shfl_down butterfly leaves the
+     true result only in lane 0 (lanes 16-31 double their segment on
+     out-of-range sources) — the online kernels broadcast
+     `__shfl_sync(FULL_WARP_MASK, v, 0)` after each reduce; the WMMA kernel
+     originally did not, so lanes 16-31 wrote weights from segment sums.
+   - other production deltas vs the micro-bench: full-range weight
+     zero-fill (padded comps), V B-fragment `comp<n_score` guard, no
+     `__launch_bounds__` (the (256,2) target faults in the -g build —
+     register-limit spills on this ROCm), the score
+     scratch stays per-block shared (fp16, 24 KiB) — no global scratch.
 
 1. **Max usable context 512K → 1M (DONE 2026-08-11, `b210a95`)** — the model's full
    `context_length` (1M) now creates a session and prefills on Strix Halo. The

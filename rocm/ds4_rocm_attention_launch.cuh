@@ -533,6 +533,35 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (uint32_t)((head_dim & 3u) == 0u));
         return cuda_ok(cudaGetLastError(), "attention indexed decode oldhip fast launch");
     }
+    /* WMMA two-pass fast path: no topk sort needed (the two-pass softmax is
+     * order-independent) and the scratch/score buffers are per-block shared. */
+    if (n_tokens > 1u &&
+        head_dim == 512u &&
+        top_k <= 512u &&
+        !g_quality_mode &&
+        n_head <= 64u) {
+        dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
+        attention_indexed_mixed_heads16_wmma_kernel<<<grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr,
+                topk_ptr,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                top_k,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention indexed wmma launch")) return 0;
+        return 1;
+    }
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");

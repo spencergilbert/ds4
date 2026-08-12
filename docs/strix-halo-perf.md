@@ -138,7 +138,9 @@ End-to-end prefill (8192-token chunks, full-prompt):
 Decode unchanged (~13 t/s). The remaining long-context indexer costs are
 the top-k CUB tree (49 ms at 64K tail, ~230 ms at 384K) and the indexed
 attention (216 ms per 8192-token chunk, flat in ctx) — both now larger
-than the score stage. CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`.
+than the score stage. CSV/SVG: `speed-bench/strix_halo_idx_direct.csv`; the
+WMMA two-pass attention numbers are in `speed-bench/strix_halo_wmma.csv`
+(§"WMMA two-pass indexed attention").
 
 ## Code Fixes Applied
 
@@ -321,3 +323,48 @@ bb95f73 docs: add Strix Halo performance investigation
 d897da4 bench: add AMD Strix Halo resident and SSD streaming results
 de65cae makefile adjustments for fedora44 build
 ```
+
+## WMMA two-pass indexed attention (2026-08-11)
+
+`attention_indexed_mixed_heads16_wmma_kernel` replaces the online kernel on
+the fast path (`!g_quality_mode`, `n_head<=64`, `top_k<=512`). Block = 1 token
+x 16 heads, 256 threads (8 warps), grid (n_tokens, n_head/16), 29.7 KiB
+shared (fp16 scores `sw[16][768]` + row arrays; no `__launch_bounds__` -- the
+(256,2) target faults in the -g build via register-limit spills on this ROCm,
+and the measured occupancy is fine without it). The three passes:
+
+1. **Score GEMM**: `scores[16][n_pad] += q16 x kv^T` with 16x16x16 fp16 WMMA
+   (fp32 accumulators). A fragments are built manually from the fp32 q buffer
+   (`batch_q_half` is NULL on ROCm); B fragments gather fp16 kv per comp from
+   the raw/comp buffers (raw rows via the ring-offset `raw_rows[]`, comp rows
+   via the filtered topk). 6 N-tiles per warp -> 768 comps max (n_score =
+   top_k 512 + raw 128 + pad). Scores are stored fp16 in shared `sw[16][768]`.
+2. **Two-pass softmax** (2 heads per warp, seeded by the sinks): per-lane
+   max/sum over the fp16 scores, then `warp_max_f32`/`warp_sum_f32` with a
+   **lane-0 broadcast** (`__shfl_sync(FULL_WARP_MASK, v, 0)`) -- the shfl_down
+   butterfly leaves the true result only in lane 0 (lanes 16-31 double their
+   segment on out-of-range sources), and without the broadcast the weights
+   written by lanes 16-31 come from segment sums (the "race" that stalled the
+   first integration attempt). Weights are fp16, zero-filled over the full
+   768 comps (production n_score is not a multiple of 16).
+3. **V GEMM**: `out[16][512] = w x kv` with fp16 weights from shared and
+   fp16 kv, fp32 accumulators; the B-fragment gather guards `comp < n_score`.
+
+Numerics: heads match a CPU fp16 two-pass model at 3e-4 (the residual is the
+WMMA accumulation order); the scores alone are bit-exact vs the fp16 model.
+End-to-end logits are argmax-stable: top-5 identical, top-5 prob mass 0.9932
+vs 0.9937, mean |logit delta| 0.32 (the 43-layer accumulation of the
+intentional fp16 q/kv/score/weight change).
+
+Performance (prefill t/s): 4112 239.0->242.8, 64K 229.4->233.0, 128K
+202.4->205.8 (+1.6-1.7%). The attention stage itself drops ~2.4x (216 -> ~90
+ms/layer at the 64K tail), but n_score is capped at 640 by top_k=512 so the
+attention is a minority of the per-chunk time. The topk sort is skipped for
+this path (the two-pass softmax is order-independent), saving its 2-5
+ms/layer-chunk. `g_quality_mode` keeps the bit-exact online kernel.
+
+The design was first validated in a standalone harness (`/tmp/attnwmma.cu`,
+`/tmp/attnwmma3.cu`, 2.2-3.5x the online reference at max|d| ~5e-5) before
+the production port; the port was debugged against real dumps (env
+`DS4_DUMP_HEADS`, since removed) with a CPU fp16 model of the exact kernel
+semantics (row construction, visibility, fp16 rounding).
