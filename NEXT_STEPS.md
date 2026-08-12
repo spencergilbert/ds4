@@ -83,6 +83,15 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    (`glm_graph_*_prefill_trace_*`) were hardcoded off — now env-gated
    (`DS4_TRACE_INDEXED_PREFILL`, `DS4_TRACE_FULL_PREFILL` + `_ALL`/`_SLOW`).
 0.7 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
+   per-k-tile shared staging variant was also tested and is definitively
+   worse: 4112 218 vs 242.5 t/s and the 64K-tail attention 580-598 vs
+   307 ms (bit-identical logits). The __syncthreads between the staging and
+   the MMAs serialize the scattered DRAM loads, destroying the cross-warp
+   latency hiding the no-staging kernel gets for free; a double-buffered
+   staging cannot fit the 64 KiB LDS (2x24 KB kv + 24 KB sw). The
+   no-staging WMMA is the final design; the attention is DRAM-bound and
+   stays at its floor.
+0.8 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
    profile (`DS4_ROCM_LAYER_STAGE_PROFILE=1`) shows the 64K-tail attention
    stage (score+topk+WMMA) at 282-312 ms/layer (vs 78 ms at 4112): the WMMA
    is DRAM-bandwidth-bound on the scattered topk comp-row gathers -- the
