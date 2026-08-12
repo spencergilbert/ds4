@@ -91,7 +91,21 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    staging cannot fit the 64 KiB LDS (2x24 KB kv + 24 KB sw). The
    no-staging WMMA is the final design; the attention is DRAM-bound and
    stays at its floor.
-0.8 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
+0.8 **Score-kernel occupancy — register-blocked too (2026-08-12).** The
+   indexer-scores direct kernel is 1 block/CU (42 KB shared + 173 VGPRs;
+   2 blocks need <=32 KB + <=128 regs). __launch_bounds__(256,2) does not
+   help (the compiler keeps 231 VGPRs -- still 1 block/CU; the 64K-tail
+   attention stage unchanged at ~312 ms). The one-head variant (fewer live
+   WMMA fragments to fit 128 regs) would lose the two-heads-interleaved
+   ILP that made the direct kernel 3.65x faster -- the same register-vs-
+   ILP wall as the attention. The fp16 index_comp was also quantified:
+   the comps are re-read ~2 GB/chunk but that is ~8 ms of the 54 ms score
+   stage (the q16 reads are already L2-shared and the kernel is
+   MMA-latency-bound); the fp16 saves ~0.5% total for the ~15-site
+   plumbing. The indexer (score 54 + topk 40 + attention ~205 ms/layer at
+   the 64K tail) is at its floor; the dense matmuls (q_path 80 + output_proj
+   105 ms/layer) are now the dominant remaining cost.
+0.9 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
    profile (`DS4_ROCM_LAYER_STAGE_PROFILE=1`) shows the 64K-tail attention
    stage (score+topk+WMMA) at 282-312 ms/layer (vs 78 ms at 4112): the WMMA
    is DRAM-bandwidth-bound on the scattered topk comp-row gathers -- the
