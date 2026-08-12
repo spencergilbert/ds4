@@ -679,7 +679,14 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-__launch_bounds__(128, 2)
+__launch_bounds__(256, 2)
+/* 8-warp batch Q8_0 GEMM: M_TILE=128 rows x 64 tokens, 256 threads.  The
+ * 4-warp (M_TILE=64) form ran at ~11-12 TFLOPS (the pure fp16 WMMA peak on
+ * gfx1151 is ~56 TFLOPS; the dequant/staging per K-block stalled the MMA
+ * issue); doubling the warps per block hides the per-warp dequant behind
+ * the other warps' MMAs: measured +13-18% at the q_path/output_proj shapes
+ * (13.2 vs 11.6 TFLOPS at 8192x5120x1536, 12.9 vs 10.9 at 8192x1536x32768),
+ * bit-exact (the per-element sums are unchanged by the tile regrouping). */
 __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         float *out,
         const unsigned char *w,
@@ -688,10 +695,10 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         uint32_t in_dim,
         uint32_t out_dim,
         uint64_t row_bytes) {
-    constexpr uint32_t M_TILE = 64u;
+    constexpr uint32_t M_TILE = 128u;
     constexpr uint32_t N_TILE = 64u;
     constexpr uint32_t K_TILE = 32u;
-    constexpr uint32_t WARPS = 4u;
+    constexpr uint32_t WARPS = 8u;
     constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
     constexpr uint32_t N_TILES_PER_WARP = N_TILE / 16u;
 
