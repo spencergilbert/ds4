@@ -82,7 +82,22 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    tail chunks whose n_comp is 8K-16K). Also: the prefill stage trace stubs
    (`glm_graph_*_prefill_trace_*`) were hardcoded off — now env-gated
    (`DS4_TRACE_INDEXED_PREFILL`, `DS4_TRACE_FULL_PREFILL` + `_ALL`/`_SLOW`).
-0.7 **WMMA occupancy (2 blocks/CU) — ruled out (2026-08-12).** The kernel
+0.7 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
+   profile (`DS4_ROCM_LAYER_STAGE_PROFILE=1`) shows the 64K-tail attention
+   stage (score+topk+WMMA) at 282-312 ms/layer (vs 78 ms at 4112): the WMMA
+   is DRAM-bandwidth-bound on the scattered topk comp-row gathers -- the
+   4 head-blocks per token pull the same ~640 selected rows from a cache
+   that grows to 33 MB/layer (the L2 is 2 MB), ~42 GB of scattered traffic
+   per layer-chunk at ~50% DRAM efficiency. Tried and rejected: grid-order
+   swap for L2 sharing (no effect -- the L2 is too small for the wave),
+   k-loop unroll 2 (no effect), 4-head-group fusion with per-k-tile shared
+   staging (cacc[4][6] = 192 VGPRs spills), 2-group fusion (also spills).
+   The register file (256 VGPRs/thread) blocks the fusion; the attention
+   stays at its current floor. A lower-register WMMA (e.g. staging the kv
+   in shared per k-tile in the existing 16-head block) remains the open
+   idea but the micro-bench showed the staged variant was 4.6x slower.
+   Occupancy work (2 blocks/CU) also ruled out: MFMA-latency-bound.
+0.8 **WMMA occupancy (2 blocks/CU) — ruled out (2026-08-12).** The kernel
    uses 158 VGPRs -> 1 block/CU (2 blocks need <=128); __launch_bounds__(256,2)
    spills and faults on this ROCm. Restructured the score GEMM to 4 N-tiles
    per warp over two 512-comp passes + the V to 2 D-tiles over two 256-dim
