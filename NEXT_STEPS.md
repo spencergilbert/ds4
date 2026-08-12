@@ -185,6 +185,14 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    (8192 chunks, explicit) or 114.98 / 9.02 (auto 4096); 1M used=119.34 /
    free=4.66 (auto 4096). Prefill 64K frontier at 768K/1M sessions:
    209.9/205.3 t/s; decode 14.7/14.4 t/s. CSV: `speed-bench/strix_halo_maxctx.csv`.
+   **Update (2026-08-12, `78335e2`)**: the <=256K ROCm default is now the
+   16384-token chunk (+1.5-1.6%: 64K 239.5 vs 235.7, 128K 208.9 vs 205.8;
+   raw ring grows to match -- `metal_graph_raw_cap_for_context`/planner twin
+   scale past 8192 only when the ubatch exceeds it). The 16K chunk OOMs at
+   384K (per-chunk scratch ~4-5 GiB over 8K), so 256K-512K keeps 8192 and
+   >=512K keeps 4096. 4112 logits bit-identical (single chunk); 64K
+   frontier argmax-stable (max|d|=2.40 vs the 8K chunk -- the documented
+   chunk-boundary logit behavior).
 
 2. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
    biggest per-layer cost (~43-49%); for agentic turn prefill (small token
