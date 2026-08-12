@@ -73,7 +73,16 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
      `__launch_bounds__` (the (256,2) target faults in the -g build —
      register-limit spills on this ROCm), the score
      scratch stays per-block shared (fp16, 24 KiB) — no global scratch.
-0.6 **fp16 compressed-KV cache — plumbing landed, cache stays F32
+0.6 **Top-k chunk size adaptive (DONE 2026-08-12)** — the CUB radix tree
+   used 8192-row chunks everywhere; the 4096-row tree is ~11% faster up to
+   16K comps (measured 39.8 vs 45.1 ms at 16384 comps x 8192 tokens in
+   `/tmp/topkbench2.cu`, bit-exact 0 mismatches vs the 8192 tree). The tree
+   path is now a templated helper dispatched on n_comp (4096 <= 16K comps,
+   8192 above); end-to-end +0.2-0.4% at 64K (the gain is limited to the
+   tail chunks whose n_comp is 8K-16K). Also: the prefill stage trace stubs
+   (`glm_graph_*_prefill_trace_*`) were hardcoded off — now env-gated
+   (`DS4_TRACE_INDEXED_PREFILL`, `DS4_TRACE_FULL_PREFILL` + `_ALL`/`_SLOW`).
+0.7 **fp16 compressed-KV cache — plumbing landed, cache stays F32
    (2026-08-11).** All ROCm attention kernels now accept `comp_kv_f16`
    (the WMMA is templated `<0>/<1>`; the online/decode/fallback/static/
    masked kernels and the cublas kv-pack read fp16 at their sites). The

@@ -36145,15 +36145,17 @@ static void glm_debug_dump_prefill_logits(const float *logits) {
 }
 
 static bool glm_graph_indexed_prefill_trace_enabled(void) {
-    return false;
+    return getenv("DS4_TRACE_INDEXED_PREFILL") != NULL;
 }
 
 static bool glm_graph_indexed_prefill_trace_all(void) {
-    return false;
+    const char *a = getenv("DS4_TRACE_INDEXED_PREFILL_ALL");
+    return a && *a && *a != '0';
 }
 
 static uint32_t glm_graph_indexed_prefill_trace_slow_ms(void) {
-    return 100u;
+    const char *s = getenv("DS4_TRACE_INDEXED_PREFILL_SLOW");
+    return s ? (uint32_t)atoi(s) : 50u;
 }
 
 static uint32_t glm_graph_indexed_prefill_drain_interval(void) {
@@ -36161,15 +36163,17 @@ static uint32_t glm_graph_indexed_prefill_drain_interval(void) {
 }
 
 static bool glm_graph_full_prefill_trace_enabled(void) {
-    return false;
+    return getenv("DS4_TRACE_FULL_PREFILL") != NULL;
 }
 
 static bool glm_graph_full_prefill_trace_all(void) {
-    return false;
+    const char *a = getenv("DS4_TRACE_FULL_PREFILL_ALL");
+    return a && *a && *a != '0';
 }
 
 static uint32_t glm_graph_full_prefill_trace_slow_ms(void) {
-    return 100u;
+    const char *s = getenv("DS4_TRACE_FULL_PREFILL_SLOW");
+    return s ? (uint32_t)atoi(s) : 50u;
 }
 
 static uint32_t glm_graph_full_prefill_drain_interval(void) {
