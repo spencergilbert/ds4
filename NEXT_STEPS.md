@@ -73,6 +73,20 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
      `__launch_bounds__` (the (256,2) target faults in the -g build —
      register-limit spills on this ROCm), the score
      scratch stays per-block shared (fp16, 24 KiB) — no global scratch.
+0.6 **fp16 compressed-KV cache — plumbing landed, cache stays F32
+   (2026-08-11).** All ROCm attention kernels now accept `comp_kv_f16`
+   (the WMMA is templated `<0>/<1>`; the online/decode/fallback/static/
+   masked kernels and the cublas kv-pack read fp16 at their sites). The
+   engine's f32->f16 store + fp16 cache allocation were already complete
+   (Metal). Flipping `DS4_GPU_ATTN_COMP_CACHE_F16` to 1 halves the
+   compressed KV (-5.25 GiB @1M, unblocks 1M@pc=8192) with logits
+   bit-identical to the fp32-cache WMMA path — but costs ~6% prefill at
+   every context (4112 242.7->229, 64K 233.0->219, 128K 205.8->192): the
+   WMMA's per-comp B-fragment gather is sector-bound, not byte-bound, so
+   2-byte loads buy nothing. No decode gain (decode is matmul-bound). The
+   cache stays F32 by default; the flag remains as a documented option for
+   memory-budget-critical 1M sessions. See `docs/strix-halo-perf.md`
+   §"fp16 compressed-KV cache".
 
 1. **Max usable context 512K → 1M (DONE 2026-08-11, `b210a95`)** — the model's full
    `context_length` (1M) now creates a session and prefills on Strix Halo. The

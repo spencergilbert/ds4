@@ -14984,6 +14984,12 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * F32 for the stable external format.  This is a storage optimization rather
  * than a semantic approximation: all Metal attention consumers already run the
  * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
+ * ROCm keeps the cache F32 by default: the fp16 cache was validated (logits
+ * bit-identical to the fp32-cache WMMA path, -5.25 GiB @1M) but costs ~6%
+ * prefill on gfx1151 -- the WMMA's scattered per-comp B-fragment gather is
+ * sector-bound, not byte-bound, so the 2-byte loads buy nothing and add
+ * conversion ALU.  The attention kernels still accept comp_kv_f16 (the flag
+ * flips to 1 below) for memory-budget-critical 1M sessions.
  */
 #if defined(__APPLE__)
 #define DS4_GPU_ATTN_COMP_CACHE_F16 1

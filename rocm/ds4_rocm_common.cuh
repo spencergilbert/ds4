@@ -369,6 +369,22 @@ __device__ static float warp_max_f32(float v) {
     return v;
 }
 
+/* Stage one float4 from a compressed-KV row that is either fp32 or fp16
+ * (fp16 comp cache).  off4 is in float4 units relative to the buffer start. */
+__device__ __forceinline__ static float4 attn_kv_f4(const __half *k16, const float *k32, uint64_t off4) {
+    if (k16) {
+        const __half *p = k16 + (off4 << 2u);
+        return make_float4(__half2float(p[0]), __half2float(p[1]),
+                           __half2float(p[2]), __half2float(p[3]));
+    }
+    return ((const float4 *)k32)[off4];
+}
+
+/* Scalar compressed-KV element read (fp32 or fp16). */
+__device__ __forceinline__ static float attn_kv_get(const __half *k16, const float *k32, uint64_t idx) {
+    return k16 ? __half2float(k16[idx]) : k32[idx];
+}
+
 __device__ static uint16_t f32_to_f16_bits_hip_round(float f) {
     union { float f; uint32_t u; } v;
     v.f = f;

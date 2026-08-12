@@ -368,3 +368,26 @@ The design was first validated in a standalone harness (`/tmp/attnwmma.cu`,
 the production port; the port was debugged against real dumps (env
 `DS4_DUMP_HEADS`, since removed) with a CPU fp16 model of the exact kernel
 semantics (row construction, visibility, fp16 rounding).
+
+## fp16 compressed-KV cache: validated, rejected for prefill perf (2026-08-11)
+
+The ROCm attention kernels now accept `comp_kv_f16` end-to-end (the WMMA is
+templated `<0>/<1>` on it; the online/decode/fallback/static/masked kernels
+and the cublas kv-pack convert fp16 rows at their read sites; the engine's
+f32->f16 store path and fp16 cache allocation were already complete from the
+Metal side). Flipping `DS4_GPU_ATTN_COMP_CACHE_F16` to 1 on ROCm:
+
+- halves the compressed-KV footprint (-5.25 GiB at 1M ctx; 1M at pc=8192
+  becomes feasible);
+- produces **bit-identical logits** to the fp32-cache WMMA path
+  (max|d| = 0.000000 at 4112 -- the f32->f16 store rounds exactly like the
+  in-kernel `__float2half`);
+- but costs **~6% prefill** at every context (4112 242.7->229, 64K
+  233.0->219, 128K 205.8->192): the WMMA's score/V B-fragment gather reads
+  one kv element per comp per tile, and each lane's 2-byte fp16 load touches
+  the same sectors as the 4-byte fp32 load (the comp rows are strided), so
+  halving the bytes buys nothing while the __half conversion and narrower
+  loads add ALU. No decode gain either (decode is matmul-bound).
+
+The cache stays F32 by default on ROCm; the fp16 option remains one flag
+flip away for memory-budget-critical 1M sessions.

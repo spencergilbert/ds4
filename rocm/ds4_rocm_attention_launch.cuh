@@ -160,7 +160,6 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -183,7 +182,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                 (float *)heads->ptr,
                 (const float *)q->ptr,
                 (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : NULL,
+                n_comp ? comp_kv->ptr : NULL,
+                (int)comp_kv_f16,
                 use_mask ? (const float *)comp_mask->ptr : NULL,
                 sinks,
                 n_raw,
@@ -203,7 +203,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                                              (int)comp_kv_f16,
                                                                               1,
                                                                               n_raw - 1u,
                                                                               n_raw,
@@ -224,7 +225,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? comp_kv->ptr : raw_kv->ptr,
+                                                 (int)comp_kv_f16,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
@@ -250,6 +252,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
                                                                    (const float *)raw_kv->ptr,
+                                                                   0,
                                                                    n_tokens,
                                                                    0,
                                                                    window,
@@ -338,6 +341,7 @@ static int attention_decode_batch_launch(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -374,7 +378,8 @@ static int attention_decode_batch_launch(
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              (int)comp_kv_f16,
                                                                               n_tokens,
                                                                               pos0,
                                                                               n_raw,
@@ -397,7 +402,8 @@ static int attention_decode_batch_launch(
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   (int)comp_kv_f16,
                                                                    n_tokens,
                                                                    pos0,
                                                                    n_raw,
@@ -415,7 +421,8 @@ static int attention_decode_batch_launch(
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 (int)comp_kv_f16,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim);
@@ -438,7 +445,7 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, NULL, NULL, 0, n_tokens, pos0,
+                                      q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim);
 }
@@ -464,9 +471,8 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim);
 }
@@ -492,7 +498,6 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     if (!heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
@@ -518,7 +523,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (float *)heads->ptr,
                 (const float *)q->ptr,
                 (const float *)raw_kv->ptr,
-                (const float *)comp_kv->ptr,
+                comp_kv->ptr,
+                (int)comp_kv_f16,
                 topk_ptr,
                 sinks,
                 n_raw,
@@ -541,24 +547,45 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         !g_quality_mode &&
         n_head <= 64u) {
         dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-        attention_indexed_mixed_heads16_wmma_kernel<<<grid, 256>>>(
-                (float *)heads->ptr,
-                sinks,
-                (const float *)q->ptr,
-                (const float *)raw_kv->ptr,
-                (const float *)comp_kv->ptr,
-                topk_ptr,
-                n_tokens,
-                pos0,
-                n_raw,
-                raw_cap,
-                raw_start,
-                n_comp,
-                top_k,
-                window,
-                ratio,
-                n_head,
-                head_dim);
+        if (comp_kv_f16) {
+            attention_indexed_mixed_heads16_wmma_kernel<1><<<grid, 256>>>(
+                    (float *)heads->ptr,
+                    sinks,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    comp_kv->ptr,
+                    topk_ptr,
+                    n_tokens,
+                    pos0,
+                    n_raw,
+                    raw_cap,
+                    raw_start,
+                    n_comp,
+                    top_k,
+                    window,
+                    ratio,
+                    n_head,
+                    head_dim);
+        } else {
+            attention_indexed_mixed_heads16_wmma_kernel<0><<<grid, 256>>>(
+                    (float *)heads->ptr,
+                    sinks,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    comp_kv->ptr,
+                    topk_ptr,
+                    n_tokens,
+                    pos0,
+                    n_raw,
+                    raw_cap,
+                    raw_start,
+                    n_comp,
+                    top_k,
+                    window,
+                    ratio,
+                    n_head,
+                    head_dim);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention indexed wmma launch")) return 0;
         return 1;
     }
@@ -580,7 +607,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                 sinks,
                                                                                 (const float *)q->ptr,
                                                                                 (const float *)raw_kv->ptr,
-                                                                                (const float *)comp_kv->ptr,
+                                                                                comp_kv->ptr,
+                                                                                (int)comp_kv_f16,
                                                                                 topk_ptr,
                                                                                 n_tokens,
                                                                                 pos0,
@@ -601,7 +629,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                            sinks,
                                                                            (const float *)q->ptr,
                                                                            (const float *)raw_kv->ptr,
-                                                                           (const float *)comp_kv->ptr,
+                                                                           comp_kv->ptr,
+                                                                           (int)comp_kv_f16,
                                                                            topk_ptr,
                                                                            n_tokens,
                                                                            pos0,
@@ -621,7 +650,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
-                                                  (const float *)comp_kv->ptr,
+                                                  comp_kv->ptr,
+                                                  (int)comp_kv_f16,
                                                   topk_ptr,
                                                   n_tokens,
                                                   pos0,
@@ -658,6 +688,7 @@ static int attention_prefill_mixed_cublas_tiled(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -687,7 +718,8 @@ static int attention_prefill_mixed_cublas_tiled(
     attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
             kv,
             (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+            (int)comp_kv_f16,
             n_tokens,
             n_comp,
             head_dim);
@@ -772,6 +804,7 @@ static int attention_prefill_mixed_launch(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -802,7 +835,8 @@ static int attention_prefill_mixed_launch(
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   (int)comp_kv_f16,
                                                                    n_tokens,
                                                                    n_comp,
                                                                    window,
@@ -827,6 +861,7 @@ static int attention_prefill_mixed_launch(
                                                         q,
                                                         raw_kv,
                                                         comp_kv,
+                                                        comp_kv_f16,
                                                         comp_mask,
                                                         use_comp_mask,
                                                         n_tokens,
@@ -843,6 +878,7 @@ static int attention_prefill_mixed_launch(
                                                         q,
                                                         raw_kv,
                                                         comp_kv,
+                                                        comp_kv_f16,
                                                         comp_mask,
                                                         use_comp_mask,
                                                         n_tokens,
@@ -858,7 +894,8 @@ static int attention_prefill_mixed_launch(
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+                (int)comp_kv_f16,
                 n_tokens,
                 n_comp,
                 head_dim);
@@ -941,7 +978,8 @@ static int attention_prefill_mixed_launch(
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
-                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                  n_comp ? comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                  (int)comp_kv_f16,
                                                   use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                   use_comp_mask, n_tokens, n_comp, window, ratio,
                                                   n_head, head_dim);
@@ -963,9 +1001,8 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, NULL, 0, n_tokens,
+                                       q, raw_kv, comp_kv, comp_kv_f16, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
@@ -985,9 +1022,8 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
+                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
 extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
