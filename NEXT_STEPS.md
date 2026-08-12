@@ -105,7 +105,17 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    plumbing. The indexer (score 54 + topk 40 + attention ~205 ms/layer at
    the 64K tail) is at its floor; the dense matmuls (q_path 80 + output_proj
    105 ms/layer) are now the dominant remaining cost.
-0.9 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
+0.9 **Dense GEMMs: Q8_0 batch 4w->8w landed (2026-08-12, `73f0a6a`); the
+   output_proj's grouped WMMA prototype is below the cublas.** The batch
+   Q8_0 GEMM (q_path etc.) went from ~20% to ~24% of the fp16 WMMA peak via
+   the 8-warp tile (+13-18%, q_path 80->72 ms/layer, bit-exact). The
+   output_proj (105 ms/layer) uses the cublas batched low-rank GEMM (~9
+   TFLOPS); a WMMA grouped prototype (heads staged in shared, Q8_0 dequant
+   per 32-dim block) measured 5.7 TFLOPS -- the heads are re-read 12.6
+   GB/chunk (each group's 16-token tile read separately, L2-thrashing) and
+   the per-warp MMA chain is latency-bound. The cublas stays for the
+   output_proj. (The grouped scalar fallback kernel is ~2 TFLOPS.)
+0.10 **Indexed-attention DRAM bound — characterized (2026-08-12).** The
    profile (`DS4_ROCM_LAYER_STAGE_PROFILE=1`) shows the 64K-tail attention
    stage (score+topk+WMMA) at 282-312 ms/layer (vs 78 ms at 4112): the WMMA
    is DRAM-bandwidth-bound on the scattered topk comp-row gathers -- the
