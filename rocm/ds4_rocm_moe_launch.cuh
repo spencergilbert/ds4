@@ -301,7 +301,7 @@ static int routed_moe_q2_float_down_launch(
     if (use_wmma_hot && hot_count != 0u) {
         constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
         const int no_n2 = 0;
-        const uint32_t wmma_mtiles = 4u;
+        const uint32_t wmma_mtiles = 8u;
         if (!no_n2) {
             if (wmma_mtiles == 4u) {
                 constexpr uint32_t mt = 4u;
@@ -1557,7 +1557,7 @@ static int routed_moe_launch(
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (ok && use_iq2_gate_wmma && iq2_gate_hot_count != 0u) {
                 constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
-                const uint32_t wmma_mtiles = 4u;
+                const uint32_t wmma_mtiles = 8u;
                 if (wmma_mtiles == 4u) {
                     constexpr uint32_t mt = 4u;
                     const dim3 block(32u * mt, 1u, 1u);
