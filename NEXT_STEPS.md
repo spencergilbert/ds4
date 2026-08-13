@@ -193,6 +193,25 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    >=512K keeps 4096. 4112 logits bit-identical (single chunk); 64K
    frontier argmax-stable (max|d|=2.40 vs the 8K chunk -- the documented
    chunk-boundary logit behavior).
+   **Update 2 (`d3972b2`)**: the indexer-scores buffer went fp16 (the score
+   kernels store `__float2half`, the topk packs a 16-bit ordered key + the
+   32-bit index into the same 64-bit CUB keys). This halved the topk's
+   score reads and the comp_cap x pc buffer, which unblocks the 16K chunk
+   at 384K (the fp32 6.4 GB device alloc exceeded the VRAM headroom) --
+   but the 16K-384K session create succeeds while the first prefill
+   chunk's cublas output temp (1280 MiB) still OOMs, so the 384K-512K
+   band keeps the 8192 chunk. The fp16 rounding shifts borderline comp
+   selections (64K frontier max|d|=1.05 vs the fp32-scores) but preserves
+   the argmax + top-5 (validated first via the fp16-rounded-fp32 trick:
+   max|d|=0.69).
+   **Update 3 (`97e67ae`)**: the MoE WMMA hotlists (gate/up IQ2 + down
+   Q2K) flipped from the 4-warp (mt=4, 128 threads) to the 8-warp (mt=8,
+   256 threads) form -- the same treatment as the Q8_0 batch (`73f0a6a`):
+   routed_moe 466 -> 409 ms/layer at the 16K chunk, 64K 239.7 -> 247.3
+   (+3.2%), 128K 210.3 -> 216.9 (+3.1%), bit-exact (the M-tile split does
+   not reorder the per-token K accumulation). mt=16 measured worse (447
+   ms). Decode unchanged (the decode's experts are all below the count>=8
+   hot threshold -- the scalar path).
 
 2. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
    biggest per-layer cost (~43-49%); for agentic turn prefill (small token
