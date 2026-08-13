@@ -16196,7 +16196,8 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     const uint64_t kv_cache_bytes = metal_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
-                     (comp_cap * prefill_cap + comp_cap) * sizeof(float);
+                     comp_cap * prefill_cap * sizeof(uint16_t) +   /* indexer scores (fp16 on ROCm) */
+                     comp_cap * sizeof(float);                      /* comp mask (per-token) */
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
@@ -17263,7 +17264,12 @@ static bool metal_graph_alloc_raw_cap(
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        /* ROCm stores the indexer scores fp16: halves the comp_cap x pc
+         * buffer (unblocks the 16384-token prefill chunk at 384K, where the
+         * fp32 6.4 GB device alloc exceeds the VRAM headroom) and halves the
+         * topk's read bandwidth. The topk sorts on the fp16-rounded scores
+         * (validated: 64K frontier max|d|=0.69, argmax + top-5 preserved). */
+        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(uint16_t));
         /* comp_mask is only consumed per-token: the batched prefill path uses
          * the indexed attention kernel (comp_selected), the batched decode-mixed
          * path never receives a mask (use_comp_mask is only set alongside
@@ -36526,9 +36532,10 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
         /* indexer_scores stays comp_cap x prefill_cap (fully used by the
-         * top-k pass); comp_mask is per-token only (comp_cap x 1 float). */
-        m.scratch_bytes = (m.comp_cap * m.prefill_cap + m.comp_cap) *
-                          sizeof(float) +
+         * top-k pass); comp_mask is per-token only (comp_cap x 1 float).
+         * The ROCm indexer scores are fp16 (see indexer_scores_by_tier). */
+        m.scratch_bytes = (m.comp_cap * m.prefill_cap * sizeof(uint16_t)) +
+                          (m.comp_cap * sizeof(float)) +
                           attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
     } else {
         m.raw_cap = ds4_default_raw_cap(ctx);
@@ -49315,7 +49322,7 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     }
     total += indexer_q_dim * sizeof(float);                /* indexer_q_by_tier */
     total += (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float); /* indexer_weights_by_tier */
-    total += (uint64_t)comp_cap * pc * sizeof(float);      /* indexer_scores_by_tier */
+    total += (uint64_t)comp_cap * pc * sizeof(uint16_t);    /* indexer_scores_by_tier (fp16 on ROCm) */
     total += (uint64_t)comp_cap * sizeof(float);           /* comp_mask_by_tier (per-token) */
     const uint64_t top_k =
         (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u);

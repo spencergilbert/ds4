@@ -52,7 +52,7 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, __half *x16, uint32
 }
 
 __global__ static void indexer_scores_kernel(
-        float *scores,
+        __half *scores,
         const float *q,
         const float *weights,
         const float *index_comp,
@@ -70,7 +70,7 @@ __global__ static void indexer_scores_kernel(
     if (causal) {
         uint32_t n_visible = (pos0 + t + 1u) / ratio;
         if (c >= n_visible) {
-            if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
+            if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = __float2half(-INFINITY);
             return;
         }
     }
@@ -90,11 +90,11 @@ __global__ static void indexer_scores_kernel(
         total += fmaxf(partial[0], 0.0f) * weights[(uint64_t)t * n_head + h];
         __syncthreads();
     }
-    if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = total * scale;
+    if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = __float2half(total * scale);
 }
 
 __global__ static void indexer_score_one_direct_kernel(
-        float *scores,
+        __half *scores,
         const float *q,
         const float *weights,
         const float *index_comp,
@@ -111,7 +111,7 @@ __global__ static void indexer_score_one_direct_kernel(
     if (causal) {
         const uint32_t visible = ratio ? (pos0 + 1u) / ratio : n_comp;
         if (c >= visible) {
-            if (tid == 0) scores[c] = -INFINITY;
+            if (tid == 0) scores[c] = __float2half(-INFINITY);
             return;
         }
     }
@@ -133,7 +133,7 @@ __global__ static void indexer_score_one_direct_kernel(
         if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
         __syncthreads();
     }
-    if (tid == 0) scores[c] = total;
+    if (tid == 0) scores[c] = __float2half(total);
 }
 
 __device__ __forceinline__ static __half indexer_q_load(const float *q, uint64_t off) {
@@ -145,7 +145,7 @@ __device__ __forceinline__ static __half indexer_q_load(const __half *q, uint64_
 
 template <typename QT>
 __global__ static void indexer_scores_wmma128_staged_kernel_t(
-        float *scores,
+        __half *scores,
         const QT *q,
         const float *weights,
         const float *index_comp,
@@ -181,7 +181,7 @@ __global__ static void indexer_scores_wmma128_staged_kernel_t(
                 const uint32_t token = tile_t + r;
                 const uint32_t comp = tile_c + c;
                 if (token < n_tokens && comp < n_comp) {
-                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+                    scores[(uint64_t)token * n_comp + comp] = __float2half(-INFINITY);
                 }
             }
             return;
@@ -291,10 +291,10 @@ __global__ static void indexer_scores_wmma128_staged_kernel_t(
             if (comp >= visible1) out1 = -INFINITY;
         }
         if (token0 < n_tokens && comp < n_comp) {
-            scores[(uint64_t)token0 * n_comp + comp] = out0;
+            scores[(uint64_t)token0 * n_comp + comp] = __float2half(out0);
         }
         if (token1 < n_tokens && comp < n_comp) {
-            scores[(uint64_t)token1 * n_comp + comp] = out1;
+            scores[(uint64_t)token1 * n_comp + comp] = __float2half(out1);
         }
     }
 #endif
@@ -311,7 +311,7 @@ __global__ static void indexer_scores_wmma128_staged_kernel_t(
  * in-bounds of the pc-sized q buffer (out-of-range rows produce garbage that
  * the token guards drop) and the weights load is clamped. */
 __global__ static void indexer_scores_wmma128_direct_kernel(
-        float *scores,
+        __half *scores,
         const __half *q,
         const float *weights,
         const float *index_comp,
@@ -348,7 +348,7 @@ __global__ static void indexer_scores_wmma128_direct_kernel(
                 const uint32_t token = tile_t + r;
                 const uint32_t comp = tile_c + c;
                 if (token < n_tokens && comp < n_comp) {
-                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+                    scores[(uint64_t)token * n_comp + comp] = __float2half(-INFINITY);
                 }
             }
             return;
@@ -434,10 +434,10 @@ __global__ static void indexer_scores_wmma128_direct_kernel(
             if (comp >= visible1) out1 = -INFINITY;
         }
         if (token0 < n_tokens && comp < n_comp) {
-            scores[(uint64_t)token0 * n_comp + comp] = out0;
+            scores[(uint64_t)token0 * n_comp + comp] = __float2half(out0);
         }
         if (token1 < n_tokens && comp < n_comp) {
-            scores[(uint64_t)token1 * n_comp + comp] = out1;
+            scores[(uint64_t)token1 * n_comp + comp] = __float2half(out1);
         }
     }
 #endif
@@ -479,16 +479,16 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
     if (tid == 0u) *out_idx = sm_idx[0];
 }
 
-__global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+__global__ static void indexer_topk_kernel(uint32_t *selected, const __half *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     uint32_t *sel = selected + (uint64_t)t * top_k;
     for (uint32_t k = 0; k < top_k; k++) sel[k] = 0;
     for (uint32_t c = 0; c < n_comp; c++) {
-        float v = row[c];
+        float v = __half2float(row[c]);
         for (uint32_t k = 0; k < top_k; k++) {
-            if ((k >= c) || v > row[sel[k]]) {
+            if ((k >= c) || v > __half2float(row[sel[k]])) {
                 for (uint32_t j = top_k - 1; j > k; j--) sel[j] = sel[j - 1];
                 sel[k] = c;
                 break;
@@ -581,9 +581,30 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
+/* fp16 score keys (the indexer-scores buffer is fp16 on ROCm): the 16-bit
+ * score sits in the key's top half, the 32-bit index in the bottom half, so
+ * the 64-bit radix sort orders by score desc then index asc (the same
+ * tie-break as topk_pack_key).  The fp16 rounding shifts borderline comp
+ * selections (measured max|d|=0.69 at the 64K frontier) but preserves the
+ * argmax and the top-5. */
+__device__ __forceinline__ static uint32_t topk_half_ordered_key(__half v) {
+    const uint32_t u = (uint32_t)__half_as_ushort(v);
+    return (u & 0x8000u) ? (~u & 0xffffu) : (u | 0x8000u);
+}
+
+__device__ __forceinline__ static uint64_t topk_pack_key_f16(__half v, uint32_t idx) {
+    return ((uint64_t)topk_half_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
+}
+
+/* fp16 key for an out-of-range/padded candidate: the fp16 -inf ordered key
+ * is 0x03ff, which sorts below every real score. */
+__device__ __forceinline__ static uint64_t topk_pack_key_f16_pad(void) {
+    return ((uint64_t)0x03ffu << 32u) | (uint64_t)0xffffffffu;
+}
+
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k) {
@@ -598,15 +619,15 @@ __global__ static void indexer_topk_8192_cub_kernel(
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= BLOCK_THREADS) return;
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     uint64_t keys[ITEMS_PER_THREAD];
 #pragma unroll
     for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
         const uint32_t i = tid * ITEMS_PER_THREAD + item;
         if (i < n_comp) {
-            keys[item] = topk_pack_key(row[i], i);
+            keys[item] = topk_pack_key_f16(row[i], i);
         } else {
-            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+            keys[item] = topk_pack_key_f16_pad();
         }
     }
 
@@ -623,7 +644,7 @@ __global__ static void indexer_topk_8192_cub_kernel(
 
 __global__ static void indexer_topk_1024_kernel(
         uint32_t *selected,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k) {
@@ -633,9 +654,9 @@ __global__ static void indexer_topk_1024_kernel(
     __shared__ float vals[1024];
     __shared__ uint32_t idxs[1024];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     if (tid < n_comp) {
-        vals[tid] = row[tid];
+        vals[tid] = __half2float(row[tid]);
         idxs[tid] = tid;
     } else {
         vals[tid] = -INFINITY;
@@ -672,7 +693,7 @@ __global__ static void indexer_topk_1024_kernel(
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_pow2_kernel(
         uint32_t *selected,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k) {
@@ -682,10 +703,10 @@ __global__ static void indexer_topk_pow2_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         if (i < n_comp) {
-            vals[i] = row[i];
+            vals[i] = __half2float(row[i]);
             idxs[i] = i;
         } else {
             vals[i] = -INFINITY;
@@ -727,7 +748,7 @@ __global__ static void indexer_topk_pow2_kernel(
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_pow2_u16_kernel(
         uint32_t *selected,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k) {
@@ -737,10 +758,10 @@ __global__ static void indexer_topk_pow2_u16_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint16_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         if (i < n_comp) {
-            vals[i] = row[i];
+            vals[i] = __half2float(row[i]);
             idxs[i] = (uint16_t)i;
         } else {
             vals[i] = -INFINITY;
@@ -782,7 +803,7 @@ __global__ static void indexer_topk_pow2_u16_kernel(
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_chunk_pow2_kernel(
         uint32_t *candidates,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
@@ -798,10 +819,10 @@ __global__ static void indexer_topk_chunk_pow2_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         if (i < chunk_n) {
-            vals[i] = row[chunk_start + i];
+            vals[i] = __half2float(row[chunk_start + i]);
             idxs[i] = chunk_start + i;
         } else {
             vals[i] = -INFINITY;
@@ -845,7 +866,7 @@ template <uint32_t SORT_N>
 __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t *selected,
         const uint32_t *candidates,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
@@ -857,14 +878,14 @@ __global__ static void indexer_topk_merge_pow2_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         uint32_t idx = UINT32_MAX;
         float v = -INFINITY;
         if (i < candidate_count) {
             idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+            if (idx < n_comp) v = __half2float(row[idx]);
         }
         vals[i] = v;
         idxs[i] = idx;
@@ -905,7 +926,7 @@ template <uint32_t SORT_N>
 __global__ static void indexer_topk_tree_merge_pow2_kernel(
         uint32_t *out,
         const uint32_t *candidates,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
@@ -927,14 +948,14 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         uint32_t idx = UINT32_MAX;
         float v = -INFINITY;
         if (i < candidate_count) {
             idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+            if (idx < n_comp) v = __half2float(row[idx]);
         }
         vals[i] = v;
         idxs[i] = idx;
@@ -1039,12 +1060,12 @@ static int indexer_scores_launch(
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(__half)) {
         return 0;
     }
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
+        indexer_score_one_direct_kernel<<<n_comp, 128>>>((__half *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
@@ -1054,7 +1075,7 @@ static int indexer_scores_launch(
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
-        indexer_scores_wmma128_staged_kernel_t<float><<<grid, 256>>>((float *)scores->ptr,
+        indexer_scores_wmma128_staged_kernel_t<float><<<grid, 256>>>((__half *)scores->ptr,
                                                               (const float *)q->ptr,
                                                               (const float *)weights->ptr,
                                                               (const float *)index_comp->ptr,
@@ -1063,7 +1084,7 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
     }
     dim3 grid(n_comp, n_tokens, 1);
-    indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
+    indexer_scores_kernel<<<grid, 256>>>((__half *)scores->ptr,
                                          (const float *)q->ptr,
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
@@ -1094,12 +1115,12 @@ static int indexer_scores_f16q_launch(
         q16->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(__half) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(__half)) {
         return 0;
     }
     if (ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
+        indexer_score_one_direct_kernel<<<n_comp, 128>>>((__half *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
@@ -1119,7 +1140,7 @@ static int indexer_scores_f16q_launch(
          * produce garbage that the token guards drop) and the weights load is
          * clamped. */
         const uint32_t pc = (uint32_t)(q16->bytes / ((uint64_t)n_head * head_dim * sizeof(__half)));
-        indexer_scores_wmma128_direct_kernel<<<grid, 256>>>((float *)scores->ptr,
+        indexer_scores_wmma128_direct_kernel<<<grid, 256>>>((__half *)scores->ptr,
                                                            (const __half *)q16->ptr,
                                                            (const float *)weights->ptr,
                                                            (const float *)index_comp->ptr,
@@ -1218,7 +1239,7 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
 template <uint32_t CHUNK_N>
 __global__ static void indexer_topk_chunk_cub_kernel(
         uint32_t *candidates,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
@@ -1236,13 +1257,13 @@ __global__ static void indexer_topk_chunk_cub_kernel(
     const uint32_t chunk_start = chunk * CHUNK_N;
     if (chunk_start >= n_comp) return;
     const uint32_t chunk_n = n_comp - chunk_start < CHUNK_N ? n_comp - chunk_start : CHUNK_N;
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     uint64_t keys[IPT];
 #pragma unroll
     for (uint32_t item = 0; item < IPT; item++) {
         const uint32_t i = tid * IPT + item;
-        if (i < chunk_n) keys[item] = topk_pack_key(row[chunk_start + i], chunk_start + i);
-        else keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+        if (i < chunk_n) keys[item] = topk_pack_key_f16(row[chunk_start + i], chunk_start + i);
+        else keys[item] = topk_pack_key_f16_pad();
     }
     BlockSort(sort_storage).SortDescending(keys);
     uint32_t *out = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
@@ -1257,7 +1278,7 @@ template <uint32_t CAP>
 __global__ static void indexer_topk_tree_merge_cub_kernel(
         uint32_t *out,
         const uint32_t *candidates,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
@@ -1280,7 +1301,7 @@ __global__ static void indexer_topk_tree_merge_cub_kernel(
     uint32_t set_count = n_sets - set0;
     if (set_count > merge_group) set_count = merge_group;
     const uint32_t candidate_count = set_count * top_k;
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
     uint64_t keys[IPT];
 #pragma unroll
@@ -1288,10 +1309,10 @@ __global__ static void indexer_topk_tree_merge_cub_kernel(
         const uint32_t i = tid * IPT + item;
         if (i < candidate_count) {
             const uint32_t idx = cand[i];
-            keys[item] = (idx < n_comp) ? topk_pack_key(row[idx], idx)
-                                        : topk_pack_key(-INFINITY, UINT32_MAX);
+            keys[item] = (idx < n_comp) ? topk_pack_key_f16(row[idx], idx)
+                                        : topk_pack_key_f16_pad();
         } else {
-            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+            keys[item] = topk_pack_key_f16_pad();
         }
     }
     BlockSort(sort_storage).SortDescending(keys);
@@ -1307,7 +1328,7 @@ template <uint32_t CAP>
 __global__ static void indexer_topk_final_merge_cub_kernel(
         uint32_t *out,
         const uint32_t *candidates,
-        const float *scores,
+        const __half *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
@@ -1322,7 +1343,7 @@ __global__ static void indexer_topk_final_merge_cub_kernel(
     const uint32_t t = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= THREADS) return;
-    const float *row = scores + (uint64_t)t * n_comp;
+    const __half *row = scores + (uint64_t)t * n_comp;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
     uint64_t keys[IPT];
 #pragma unroll
@@ -1330,10 +1351,10 @@ __global__ static void indexer_topk_final_merge_cub_kernel(
         const uint32_t i = tid * IPT + item;
         if (i < candidate_count) {
             const uint32_t idx = cand[i];
-            keys[item] = (idx < n_comp) ? topk_pack_key(row[idx], idx)
-                                        : topk_pack_key(-INFINITY, UINT32_MAX);
+            keys[item] = (idx < n_comp) ? topk_pack_key_f16(row[idx], idx)
+                                        : topk_pack_key_f16_pad();
         } else {
-            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
+            keys[item] = topk_pack_key_f16_pad();
         }
     }
     BlockSort(sort_storage).SortDescending(keys);
@@ -1402,7 +1423,7 @@ static int indexer_topk_tree_launch(
     dim3 grid_chunks(n_tokens, n_chunks, 1);
     indexer_topk_chunk_cub_kernel<CHUNK_N><<<grid_chunks, 512, smem>>>(
             cur,
-            (const float *)scores->ptr,
+            (const __half *)scores->ptr,
             n_comp,
             n_tokens,
             top_k,
@@ -1417,7 +1438,7 @@ static int indexer_topk_tree_launch(
         indexer_topk_tree_merge_cub_kernel<CHUNK_N><<<grid_merge, 512, smem>>>(
                 next,
                 cur,
-                (const float *)scores->ptr,
+                (const __half *)scores->ptr,
                 n_comp,
                 n_tokens,
                 top_k,
@@ -1434,7 +1455,7 @@ static int indexer_topk_tree_launch(
     indexer_topk_final_merge_cub_kernel<CHUNK_N><<<n_tokens, 512, smem>>>(
             (uint32_t *)selected->ptr,
             cur,
-            (const float *)scores->ptr,
+            (const __half *)scores->ptr,
             n_comp,
             n_tokens,
             top_k,
@@ -1451,19 +1472,19 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         uint32_t                top_k) {
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
         top_k > n_comp ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(__half) ||
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
     if (top_k == 512u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                     (const float *)scores->ptr,
+                                                     (const __half *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
+                                                           (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
@@ -1485,14 +1506,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 smem);
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
+                                                                                 (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
+                                                           (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
@@ -1514,32 +1535,32 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 smem);
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
+                                                                                 (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                               (const float *)scores->ptr,
+                                                               (const __half *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 1024u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                     (const float *)scores->ptr,
+                                                     (const __half *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024x1024 launch");
     }
     if (top_k == 1024u && n_comp <= 2048u) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
+                                                           (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048x1024 launch");
     }
     if (top_k == 1024u && n_comp <= 4096u) {
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
+                                                           (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096x1024 launch");
     }
@@ -1561,20 +1582,20 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 smem);
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
+                                                                                 (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192x1024 cub launch");
                 }
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                               (const float *)scores->ptr,
+                                                               (const __half *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192x1024 launch");
     }
     if (top_k == 2048u && n_comp <= 4096u) {
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
+                                                           (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096x2048 launch");
     }
@@ -1596,14 +1617,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 smem);
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
+                                                                                 (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192x2048 cub launch");
                 }
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                               (const float *)scores->ptr,
+                                                               (const __half *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192x2048 launch");
     }
@@ -1642,7 +1663,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         uint32_t cur_stride = candidate_stride;
         dim3 grid_chunks(n_tokens, n_chunks, 1);
         indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
-                                                                    (const float *)scores->ptr,
+                                                                    (const __half *)scores->ptr,
                                                                     n_comp,
                                                                     n_tokens,
                                                                     top_k,
@@ -1657,7 +1678,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024>>>(
                     next,
                     cur,
-                    (const float *)scores->ptr,
+                    (const __half *)scores->ptr,
                     n_comp,
                     n_tokens,
                     top_k,
@@ -1673,7 +1694,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
 
         indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                                  cur,
-                                                                 (const float *)scores->ptr,
+                                                                 (const __half *)scores->ptr,
                                                                  n_comp,
                                                                  n_tokens,
                                                                  top_k,
@@ -1682,7 +1703,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
-                                         (const float *)scores->ptr,
+                                         (const __half *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
