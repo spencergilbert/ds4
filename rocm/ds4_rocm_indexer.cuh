@@ -1148,7 +1148,7 @@ static int indexer_scores_launch(
     }
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u && !g_quality_mode) {
-        indexer_score_one_wmma_kernel<<<(n_comp + 31u) / 32u, 256>>>((__half *)scores->ptr,
+        indexer_score_one_wmma_kernel<<<(n_comp + 31u) / 32u, 256, 0, g_compute_stream>>>((__half *)scores->ptr,
                                                                    (const float *)q->ptr,
                                                                    (const float *)weights->ptr,
                                                                    (const float *)index_comp->ptr,
@@ -1157,7 +1157,7 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer score one wmma launch");
     }
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((__half *)scores->ptr,
+        indexer_score_one_direct_kernel<<<n_comp, 128, 0, g_compute_stream>>>((__half *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
@@ -1167,7 +1167,7 @@ static int indexer_scores_launch(
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
-        indexer_scores_wmma128_staged_kernel_t<float><<<grid, 256>>>((__half *)scores->ptr,
+        indexer_scores_wmma128_staged_kernel_t<float><<<grid, 256, 0, g_compute_stream>>>((__half *)scores->ptr,
                                                               (const float *)q->ptr,
                                                               (const float *)weights->ptr,
                                                               (const float *)index_comp->ptr,
@@ -1176,7 +1176,7 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
     }
     dim3 grid(n_comp, n_tokens, 1);
-    indexer_scores_kernel<<<grid, 256>>>((__half *)scores->ptr,
+    indexer_scores_kernel<<<grid, 256, 0, g_compute_stream>>>((__half *)scores->ptr,
                                          (const float *)q->ptr,
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
@@ -1212,7 +1212,7 @@ static int indexer_scores_f16q_launch(
     }
     if (ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((__half *)scores->ptr,
+        indexer_score_one_direct_kernel<<<n_comp, 128, 0, g_compute_stream>>>((__half *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
@@ -1232,7 +1232,7 @@ static int indexer_scores_f16q_launch(
          * produce garbage that the token guards drop) and the weights load is
          * clamped. */
         const uint32_t pc = (uint32_t)(q16->bytes / ((uint64_t)n_head * head_dim * sizeof(__half)));
-        indexer_scores_wmma128_direct_kernel<<<grid, 256>>>((__half *)scores->ptr,
+        indexer_scores_wmma128_direct_kernel<<<grid, 256, 0, g_compute_stream>>>((__half *)scores->ptr,
                                                            (const __half *)q16->ptr,
                                                            (const float *)weights->ptr,
                                                            (const float *)index_comp->ptr,
@@ -1513,7 +1513,7 @@ static int indexer_topk_tree_launch(
     n_sets = n_chunks;
     uint32_t cur_stride = candidate_stride;
     dim3 grid_chunks(n_tokens, n_chunks, 1);
-    indexer_topk_chunk_cub_kernel<CHUNK_N><<<grid_chunks, 512, smem>>>(
+    indexer_topk_chunk_cub_kernel<CHUNK_N><<<grid_chunks, 512, smem, g_compute_stream>>>(
             cur,
             (const __half *)scores->ptr,
             n_comp,
@@ -1527,7 +1527,7 @@ static int indexer_topk_tree_launch(
         const uint32_t next_stride = next_sets * top_k;
         uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
         dim3 grid_merge(n_tokens, next_sets, 1);
-        indexer_topk_tree_merge_cub_kernel<CHUNK_N><<<grid_merge, 512, smem>>>(
+        indexer_topk_tree_merge_cub_kernel<CHUNK_N><<<grid_merge, 512, smem, g_compute_stream>>>(
                 next,
                 cur,
                 (const __half *)scores->ptr,
@@ -1544,7 +1544,7 @@ static int indexer_topk_tree_launch(
         cur_stride = next_stride;
     }
 
-    indexer_topk_final_merge_cub_kernel<CHUNK_N><<<n_tokens, 512, smem>>>(
+    indexer_topk_final_merge_cub_kernel<CHUNK_N><<<n_tokens, 512, smem, g_compute_stream>>>(
             (uint32_t *)selected->ptr,
             cur,
             (const __half *)scores->ptr,
@@ -1569,13 +1569,13 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return 0;
     }
     if (top_k == 512u && n_comp <= 1024u) {
-        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_1024_kernel<<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                      (const __half *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u) {
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                            (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
@@ -1597,14 +1597,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                                  (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                            (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
@@ -1626,32 +1626,32 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                                  (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                (const __half *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 1024u && n_comp <= 1024u) {
-        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_1024_kernel<<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                      (const __half *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024x1024 launch");
     }
     if (top_k == 1024u && n_comp <= 2048u) {
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                            (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048x1024 launch");
     }
     if (top_k == 1024u && n_comp <= 4096u) {
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                            (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096x1024 launch");
@@ -1673,20 +1673,20 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                                  (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192x1024 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                (const __half *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192x1024 launch");
     }
     if (top_k == 2048u && n_comp <= 4096u) {
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                            (const __half *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096x2048 launch");
@@ -1708,14 +1708,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                                  (const __half *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192x2048 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                (const __half *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192x2048 launch");
@@ -1754,7 +1754,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         n_sets = n_chunks;
         uint32_t cur_stride = candidate_stride;
         dim3 grid_chunks(n_tokens, n_chunks, 1);
-        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
+        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024, 0, g_compute_stream>>>(cur,
                                                                     (const __half *)scores->ptr,
                                                                     n_comp,
                                                                     n_tokens,
@@ -1767,7 +1767,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             const uint32_t next_stride = next_sets * top_k;
             uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
             dim3 grid_merge(n_tokens, next_sets, 1);
-            indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024>>>(
+            indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024, 0, g_compute_stream>>>(
                     next,
                     cur,
                     (const __half *)scores->ptr,
@@ -1784,7 +1784,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             cur_stride = next_stride;
         }
 
-        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                                                  cur,
                                                                  (const __half *)scores->ptr,
                                                                  n_comp,
@@ -1794,7 +1794,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  cur_stride);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
-    indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
+    indexer_topk_kernel<<<n_tokens, 1, 0, g_compute_stream>>>((uint32_t *)selected->ptr,
                                          (const __half *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
@@ -1811,7 +1811,7 @@ extern "C" int ds4_gpu_argmax_tensor(
         logits->bytes < logits_bytes) {
         return 0;
     }
-    argmax_kernel<<<1, 1024>>>((int32_t *)out_idx->ptr,
+    argmax_kernel<<<1, 1024, 0, g_compute_stream>>>((int32_t *)out_idx->ptr,
                                (const float *)logits->ptr,
                                n_vocab);
     return cuda_ok(cudaGetLastError(), "argmax launch");
@@ -1887,7 +1887,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
     uint64_t n = (uint64_t)n_tokens * n_comp;
     uint64_t nk = (uint64_t)n_tokens * top_k;
     uint64_t blocks = ((n > nk ? n : nk) + 255) / 256;
-    topk_mask_kernel<<<blocks, 256>>>((float *)mask->ptr,
+    topk_mask_kernel<<<blocks, 256, 0, g_compute_stream>>>((float *)mask->ptr,
                                       (const uint32_t *)topk->ptr,
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
@@ -1898,7 +1898,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, NULL, n_rows, head_dim, 1, n_rows);
+    indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, g_compute_stream>>>((float *)x->ptr, NULL, n_rows, head_dim, 1, n_rows);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
 
@@ -1910,6 +1910,6 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_f16_tensor(ds4_gpu_tensor *x, ds4_gpu_te
     }
     const uint32_t token_cap = (uint32_t)(x16->bytes / ((uint64_t)n_head * head_dim * sizeof(__half)));
     if (token_cap == 0) return 0;
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, (__half *)x16->ptr, n_rows, head_dim, n_head, token_cap);
+    indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, g_compute_stream>>>((float *)x->ptr, (__half *)x16->ptr, n_rows, head_dim, n_head, token_cap);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 f16 launch");
 }

@@ -66630,8 +66630,27 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
             ok = metal_graph_encode_session_batch_single_gpu(
                     items, count, &e->model, &e->weights);
         } else {
+            /* Multi-stream: launch each session's per-token chain on its own
+             * non-blocking stream so the GPU can overlap the latency-bound
+             * M=1 kernels across sessions (the single legacy stream would
+             * serialize them and leave the CU idle during the M=1 launches).
+             * ds4_gpu_end_commands (the cudaDeviceSynchronize below) drains
+             * every stream before the logits readback. */
+            const char *ms = getenv("DS4_CUDA_SESSION_BATCH_MULTI_STREAM");
+            const bool use_multi_stream = !ms || !ms[0] ||
+                                          strcmp(ms, "0") != 0;
+            void **streams = NULL;
+            if (ok && use_multi_stream) {
+                streams = (void **)xmalloc((size_t)count * sizeof(void *));
+                if (!streams) ok = false;
+                for (int i = 0; ok && i < count; i++) {
+                    streams[i] = ds4_gpu_create_stream();
+                    if (!streams[i]) ok = false;
+                }
+            }
             for (int i = 0; ok && i < count; i++) {
                 ds4_session *s = items[i].session;
+                if (streams) ds4_gpu_set_stream(streams[i]);
                 ok = metal_graph_encode_token_raw_swa(
                         &s->graph,
                         &e->model,
@@ -66640,6 +66659,11 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                         (uint32_t)s->checkpoint.len,
                         true,
                         false);
+            }
+            if (streams) {
+                ds4_gpu_set_stream(NULL);
+                for (int i = 0; i < count; i++) ds4_gpu_destroy_stream(streams[i]);
+                free(streams);
             }
         }
         if (ok) ok = ds4_gpu_end_commands() != 0;

@@ -13,6 +13,19 @@ static int g_ssd_streaming_mode;
 static cudaStream_t g_model_upload_stream;
 static cudaStream_t g_stream_selected_upload_stream;
 static cudaStream_t g_selected_readback_stream;
+static cudaStream_t g_compute_stream = NULL;
+
+/* Per-decode-stream cublas handles and temp scratch: the batched decode
+ * runs the sessions concurrently on separate streams, but the cublas handle
+ * is stream-bound and the grow-only g_cuda_tmp scratch is shared, so each
+ * stream needs its own handle + scratch slot. */
+#define DS4_DECODE_STREAM_SLOTS 32
+static cudaStream_t g_cblas_slot_stream[DS4_DECODE_STREAM_SLOTS];
+static cublasHandle_t g_cblas_slot_handle[DS4_DECODE_STREAM_SLOTS];
+static int g_cblas_slot_used[DS4_DECODE_STREAM_SLOTS];
+static cudaStream_t g_tmp_slot_stream[DS4_DECODE_STREAM_SLOTS];
+static void *g_tmp_slot_ptr[DS4_DECODE_STREAM_SLOTS];
+static uint64_t g_tmp_slot_bytes[DS4_DECODE_STREAM_SLOTS];
 static cudaEvent_t g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
@@ -565,13 +578,76 @@ __global__ static void dequant_q8_0_to_f16_transpose_kernel(
 
 static void cuda_shared_gate_up_async_cleanup(void);
 
+/* The cublas handle bound to the current compute stream (or the default
+ * handle for the legacy stream 0).  The batched decode's per-session streams
+ * must not share the default handle -- the handle is stream-bound and the
+ * concurrent sessions would race its internal workspace. */
+static cublasHandle_t cuda_cublas_handle(void) {
+    if (!g_compute_stream) return g_cublas;
+    for (int i = 0; i < DS4_DECODE_STREAM_SLOTS; i++) {
+        if (g_cblas_slot_used[i] && g_cblas_slot_stream[i] == g_compute_stream) {
+            return g_cblas_slot_handle[i];
+        }
+    }
+    for (int i = 0; i < DS4_DECODE_STREAM_SLOTS; i++) {
+        if (!g_cblas_slot_used[i]) {
+            cublasHandle_t h = NULL;
+            if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) return g_cublas;
+            const cublasMath_t math_mode =
+                g_quality_mode ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH;
+            (void)cublasSetMathMode(h, math_mode);
+            (void)hipblasSetStream(h, g_compute_stream);
+            g_cblas_slot_stream[i] = g_compute_stream;
+            g_cblas_slot_handle[i] = h;
+            g_cblas_slot_used[i] = 1;
+            return h;
+        }
+    }
+    return g_cublas;
+}
+
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    if (!g_compute_stream) {
+        if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+        if (g_cuda_tmp) {
+            (void)cudaFree(g_cuda_tmp);
+            g_cuda_tmp = NULL;
+            g_cuda_tmp_bytes = 0;
+        }
+        void *ptr = NULL;
+        cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "temp alloc failed for %s (%.2f MiB): %s\n",
+                    what ? what : "scratch", (double)bytes / 1048576.0, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        g_cuda_tmp = ptr;
+        g_cuda_tmp_bytes = bytes;
+        return g_cuda_tmp;
+    }
+    /* Per-stream scratch: the concurrent decode sessions must not share the
+     * grow-only g_cuda_tmp buffer. */
+    int slot = -1;
+    for (int i = 0; i < DS4_DECODE_STREAM_SLOTS; i++) {
+        if (g_tmp_slot_stream[i] == g_compute_stream) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < DS4_DECODE_STREAM_SLOTS; i++) {
+            if (g_tmp_slot_stream[i] == NULL) {
+                g_tmp_slot_stream[i] = g_compute_stream;
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) return NULL;
+    if (g_tmp_slot_bytes[slot] >= bytes) return g_tmp_slot_ptr[slot];
+    if (g_tmp_slot_ptr[slot]) {
+        (void)cudaFree(g_tmp_slot_ptr[slot]);
+        g_tmp_slot_ptr[slot] = NULL;
+        g_tmp_slot_bytes[slot] = 0;
     }
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
@@ -581,9 +657,9 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
         (void)cudaGetLastError();
         return NULL;
     }
-    g_cuda_tmp = ptr;
-    g_cuda_tmp_bytes = bytes;
-    return g_cuda_tmp;
+    g_tmp_slot_ptr[slot] = ptr;
+    g_tmp_slot_bytes[slot] = bytes;
+    return ptr;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -5078,7 +5154,7 @@ static const __half *cuda_q8_f16_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(dev,
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256, 0, g_compute_stream>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,
@@ -5133,7 +5209,7 @@ static const __half *cuda_q8_f16_transpose_ptr(
     }
     const uint64_t blocks = (in_dim + 31u) / 32u;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_transpose_kernel<<<(n + 255u) / 256u, 256>>>(dev,
+    dequant_q8_0_to_f16_transpose_kernel<<<(n + 255u) / 256u, 256, 0, g_compute_stream>>>(dev,
                                                                      (const unsigned char *)q8,
                                                                      in_dim,
                                                                      out_dim,
@@ -5182,7 +5258,7 @@ static void cuda_q8_f16_warmup_attention_output_a_gemm(const __half *out_a_f16,
     if (cudaMemset(heads_h, 0, (size_t)heads_h_bytes) != cudaSuccess) return;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+    cublasStatus_t st = cublasGemmStridedBatchedEx(cuda_cublas_handle(),
                                                    CUBLAS_OP_T,
                                                    CUBLAS_OP_N,
                                                    (int)rank,
@@ -5228,7 +5304,7 @@ static void cuda_q8_f16_warmup_attention_output_b_gemm(const __half *out_b_f16_t
     if (cudaMemset(low_h, 0, (size_t)low_h_bytes) != cudaSuccess) return;
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    cublasStatus_t st = cublasGemmEx(g_cublas,
+    cublasStatus_t st = cublasGemmEx(cuda_cublas_handle(),
                                      CUBLAS_OP_N,
                                      CUBLAS_OP_N,
                                      (int)out_dim,
@@ -6017,7 +6093,7 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
-    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+    fill_f32_kernel<<<(count + 255u) / 256u, 256, 0, g_compute_stream>>>((float *)tensor->ptr, count, value);
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
@@ -6049,7 +6125,32 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
+
+/* Per-session decode streams: the batched decode launches each session's
+ * per-token kernel chain on its own non-blocking stream so the GPU can
+ * overlap the latency-bound M=1 kernels across sessions.  g_compute_stream
+ * defaults to NULL (the legacy stream 0); the kernel launches use it as the
+ * 4th <<<>>> argument. */
+extern "C" void ds4_gpu_set_stream(void *stream) {
+    g_compute_stream = (cudaStream_t)stream;
+}
+extern "C" void *ds4_gpu_get_stream(void) {
+    return (void *)g_compute_stream;
+}
+extern "C" void *ds4_gpu_create_stream(void) {
+    cudaStream_t s = NULL;
+    cudaError_t err = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "decode stream create failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return (void *)s;
+}
+extern "C" void ds4_gpu_destroy_stream(void *stream) {
+    if (stream) (void)cudaStreamDestroy((cudaStream_t)stream);
+}extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
 extern "C" int ds4_gpu_commands_active(void) { return 0; }
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     if (!event_value) return 0;

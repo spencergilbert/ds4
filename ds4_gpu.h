@@ -109,6 +109,10 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+void ds4_gpu_set_stream(void *stream);
+void *ds4_gpu_get_stream(void);
+void *ds4_gpu_create_stream(void);
+void ds4_gpu_destroy_stream(void *stream);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
