@@ -212,6 +212,18 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    not reorder the per-token K accumulation). mt=16 measured worse (447
    ms). Decode unchanged (the decode's experts are all below the count>=8
    hot threshold -- the scalar path).
+   **Update 5 (`be18d4e`)**: the decode's per-token indexer score now uses
+   a dedicated WMMA kernel (comps in the M, the 64 heads in the N -- both
+   dimensions full for M==1, unlike the batch kernel's token-in-M which
+   wastes 15/16 of the tile). decode_score 0.333 -> 0.111 ms/layer at the
+   64K tail (3x, ~-4.7 ms/token across the 21 ratio-4 layers, ~6% of the
+   decode). Bit-identical: a 16-token greedy continuation matches the
+   scalar path with max logit delta 0.000000 (the fp16 A/B staging matches
+   the prefill's f16q path and the fp16 score store rounds both identically).
+   The remaining decode cost is the M=1 GEMM execution (q_path/MoE/shared/
+   output_proj -- the matmul-bound floor; the decode is already dspark
+   graph-captured so the launch overhead is not the issue). The batched
+   decode (the server's --batched-session) is the remaining big lever.
    **Update 4 (`f882095`)**: the 8192-token chunk is now the default
    through 768K. The fp16 scores (`d3972b2`) halved the comp_cap x pc
    buffer, bringing the 768K@8192 session to 119.25 GiB (4.75 free) --
