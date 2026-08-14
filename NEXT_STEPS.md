@@ -358,6 +358,49 @@ chunks exceed the raw SWA cache cap (8192) and fail. Raw SWA cache grows to
 
 ## Next Steps (in priority order)
 
+### 0. Single-GPU batched decode (the remaining big lever — investigated 2026-08-14)
+
+The server's `--batched-session N` coalesces decode-ready sessions into
+`ds4_sessions_eval_batch`, but on the single-GPU Strix Halo it gives
+**zero throughput** (measured 4 concurrent clients: 10.2 vs 10.1 tok/s
+aggregate) because the M=N stage grouping (`metal_graph_encode_session_pipeline_batch`)
+is gated behind `cuda_tp_decode` + `first->graph.placement` (the tensor-
+parallel). The single GPU falls back to the sequential
+`metal_graph_encode_token_raw_swa` per session.
+
+The decode is ~73% M=1 GEMMs (q_path 0.245 + routed_moe 0.33 + shared
+0.19 + output_proj ~0.2 ms/layer) running at their worst tile shape; the
+M=N grouping would drop them ~10x (the decode 68 -> ~23 ms/token, ~14.7 ->
+~43 t/s aggregate).
+
+**The port is tractable**: the session-batch grouping functions
+(`metal_graph_encode_ffn_pre_session_batch`, `_routed_session_batch`,
+`_shared_session_batch`, `_qkv_session_batch`, `_attention_session_batch`,
+`_attn_pre_session_batch`) already do the M=N work on the shared `batch_*`
+buffers and are single-tier-capable (the `active_tier == 0` path is the
+no-op). The work is:
+
+1. Add single-GPU variants of `metal_graph_session_batch_*_supported`
+   (drop the `cuda_tp_decode`/`cuda_tp_ep`/`placement` requirements; the
+   expert-parallel split collapses to the one tier).
+2. Write `metal_graph_encode_session_batch_single_gpu(items, count, ...)`
+   modeled on `metal_graph_encode_session_pipeline_batch` but with the
+   tier routing removed: per-session embed -> per-layer { per-session
+   `METAL_DECODE_LAYER_TO_FFN` phase (the attention + output_proj) ->
+   gather the N `after_attn_hc` rows -> grouped FFN
+   (`_ffn_pre_session_batch` + `_routed_session_batch` +
+   `_shared_session_batch`) -> scatter `batch_next_hc` back } ->
+   per-session output head.
+3. Wire it into `ds4_sessions_eval_batch_cuda`'s no-TP branch, env-gated
+   (`DS4_CUDA_SESSION_BATCH_SINGLE_GPU`), measured with the concurrent-
+   client harness (`/tmp/decode_client.sh`).
+
+Incremental order: FFN-first (MoE + shared ~32% of the decode, no KV
+coupling), then q_path + output_proj, leaving the attention + indexer
+per-session (each session has its own KV/comp cache and position).
+
+
+
 ### 1. Indexer top-k kernel (DONE 2026-08-10)
 
 Replaced the 4096-row bitonic tree (144-pass full sorts to extract top-512)
