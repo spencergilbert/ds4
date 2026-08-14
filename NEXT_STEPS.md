@@ -408,13 +408,20 @@ is CORRECT (the 64-token greedy continuation matches the sequential's
 content apart from borderline punctuation flips -- the M=N FFN's fp16 WMMA
 vs the M=1's fp32 scalar/cublas, the same class as the prefill's fp16 MoE)
 but measured 9.1 vs 13.3 tok/s aggregate at 4 concurrent clients (-32%).
-Two causes: (1) at N=4 the M=N GEMMs hit the 128-tile waste (4/128 rows
-valid), and (2) the phase split serializes the N latency-bound M=1
-attentions ahead of the FFN, destroying the per-session attention<->FFN
-pipelining that the sequential decode overlaps. The win needs the FULL
-grouping (attention + FFN both batched M=N) so the pipeline stages stay
-filled, which requires batching the per-session attention -- the remaining
-hard part (per-session KV/comp caches and positions).
+Two causes: (1) the M=N GEMMs hit the tile waste at small N -- measured
+the M=4 FFN batch at 3.3 ms vs 4x the M=1 FFN's 2.24 ms (+47%, the q8
+M_TILE=128 and the tile8 MoE at a mostly-empty tile), and (2) the phase
+split serializes the N latency-bound M=1 attentions ahead of the FFN,
+destroying the per-session attention<->FFN pipelining that the sequential
+decode overlaps. N=16 measured -23% (10.3 vs 13.4 tok/s), N=4 -32% -- the
+FFN-only grouping loses at every realistic batch size (the M=N win needs
+~64+ sessions for the full tiles, which a single-user server never sees).
+The win needs the FULL grouping (attention + FFN + q_path + output_proj
+all batched M=N) so the launch amortization spans ~78% of the decode and
+the pipeline stages stay filled, which requires batching the per-session
+attention -- the remaining hard part (per-session KV/comp caches and
+positions). The FFN grouping's gather/scatter + FFN-batch orchestration is
+reusable scaffolding for that.
 
 
 
