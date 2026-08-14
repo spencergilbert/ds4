@@ -433,6 +433,12 @@ concurrent clients 14.9 vs 13.3 tok/s aggregate (+12%), bit-identical
 output. The M=N FFN grouping remains a net loss at realistic N (the M=N win
 needs ~64+ sessions for the full tiles), so the batched decode's real win
 is the stream overlap; the FFN grouping stays env-gated off.
+- **Q8_0 LUT dequant (tried 2026-08-14, reverted)**: a 256-entry int8->fp16
+  shared lookup replacing the per-element VALU I2F+F2F in the 8-warp batch
+  GEMM is bit-exact but neutral (32K 261.5 vs 262.0, 64K 245.8 vs 247.3).
+  The dequant is not the bottleneck in the 8-warp form (73f0a6a already hid
+  it behind the other warps' MMA issue); the added LDS traffic offsets the
+  saved VALU. The q8 GEMMs are MMA-issue-bound, not dequant-bound.
 
 
 
