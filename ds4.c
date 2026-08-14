@@ -12174,22 +12174,25 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
             }
         } else if (prompt_len > 4096) {
 #ifdef DS4_ROCM_BUILD
-            if (prompt_len > 512 * 1024) {
-                /* Very long contexts (>=512K): drop to a 4096-token chunk so
-                 * the per-chunk scratch (indexer scores buffer, batch HC) stays
-                 * inside the ~121 GiB GTT budget. 8192-token chunks would need
-                 * ~4-5 GiB more and OOM session create past ~768K. The smaller
+            if (prompt_len > 768 * 1024 + 2) {
+                /* Very long contexts (>768K): drop to a 4096-token chunk so
+                 * the per-chunk scratch stays inside the ~121 GiB GTT budget.
+                 * The 8192 chunk fits through 768K (768K@8192 session 119.25
+                 * GiB / 4.75 free with the fp16 scores) but the 1M@8192
+                 * session OOMs (129.8 GiB total vs the 124 GTT). The smaller
                  * chunk costs ~5-6% prefill on runs that are already
                  * indexer-bound at these lengths. Note the 4096-vs-8192 chunk
                  * logit difference is pre-existing engine behavior (the raw SWA
                  * cache holds the whole current ubatch raw, so the chunk size
-                 * sets the uncompressed attention window); there is no 8192
-                 * alternative at >=512K (it does not fit). */
+                 * sets the uncompressed attention window). */
                 cap = 4096u;
             } else if (prompt_len > 256 * 1024) {
-                /* 256K-512K: the 16384-token chunk's per-chunk scratch
-                 * (~4-5 GiB more than 8192) does not fit at 384K (OOM), so
-                 * stay at the 8192 that fits through 512K. */
+                /* 256K-768K: the 16384-token chunk does not fit at 384K (the
+                 * first chunk's cublas output temp OOMs), so 256K-384K keeps
+                 * the 8192. The fp16 indexer scores (d3972b2) unblocked the
+                 * 8192 chunk through 768K (768K@8192 session 119.25 GiB,
+                 * 4.75 free; 1M@8192 does not fit, hence the >512K 4096
+                 * band above keeps the ceiling at 768K). */
                 cap = 8192u;
             } else {
                 /* ROCm (Strix Halo): 16384-token chunks measured ~1.5-1.6%
