@@ -399,6 +399,23 @@ Incremental order: FFN-first (MoE + shared ~32% of the decode, no KV
 coupling), then q_path + output_proj, leaving the attention + indexer
 per-session (each session has its own KV/comp cache and position).
 
+**FFN-first result (2026-08-14): the FFN-only grouping is a NEGATIVE at
+small batch sizes -- landed env-gated off (`DS4_CUDA_SESSION_BATCH_SINGLE_GPU=1`
+to enable).** `metal_graph_encode_session_batch_single_gpu` (the per-session
+`METAL_DECODE_LAYER_TO_FFN` phase + the gather of the N after-attn HC rows
++ the prefill's `metal_graph_encode_layer_ffn_batch` at M=N + the scatter)
+is CORRECT (the 64-token greedy continuation matches the sequential's
+content apart from borderline punctuation flips -- the M=N FFN's fp16 WMMA
+vs the M=1's fp32 scalar/cublas, the same class as the prefill's fp16 MoE)
+but measured 9.1 vs 13.3 tok/s aggregate at 4 concurrent clients (-32%).
+Two causes: (1) at N=4 the M=N GEMMs hit the 128-tile waste (4/128 rows
+valid), and (2) the phase split serializes the N latency-bound M=1
+attentions ahead of the FFN, destroying the per-session attention<->FFN
+pipelining that the sequential decode overlaps. The win needs the FULL
+grouping (attention + FFN both batched M=N) so the pipeline stages stay
+filled, which requires batching the per-session attention -- the remaining
+hard part (per-session KV/comp caches and positions).
+
 
 
 ### 1. Indexer top-k kernel (DONE 2026-08-10)

@@ -65788,6 +65788,131 @@ static bool metal_graph_encode_shared_session_batch(
  * which serializes the nominal pipeline.  Stage-major submission leaves each
  * session's kernel arithmetic untouched while allowing B's previous stage to
  * overlap A's next stage. */
+/* Single-GPU (no tensor-parallel) batched decode: group the FFN across the
+ * N decode-ready sessions while the attention + indexer stay per-session
+ * (each session has its own KV/comp cache and position).  Per layer each
+ * session runs the attention + output projection (the METAL_DECODE_LAYER_TO_FFN
+ * phase) producing its after-attn residual HC; those N rows are gathered into
+ * the first session's batch_after_attn_hc, the whole FFN runs once at M=N via
+ * the prefill's metal_graph_encode_layer_ffn_batch, and the resulting
+ * batch_next_hc rows are scattered back into each session's after_ffn_hc.
+ *
+ * The M=1 FFN (MoE + shared) is ~0.5 ms/layer of the ~1.5 ms decode layer;
+ * the M=N grouping drops it ~10x (the q8/MoE kernels at the full tile). */
+static bool metal_graph_encode_session_batch_single_gpu(
+        ds4_decode_item *items,
+        int count,
+        const ds4_model *model,
+        const ds4_weights *weights) {
+    if (!items || count < 2 || !model || !weights) return false;
+    ds4_gpu_graph *first = &items[0].session->graph;
+    if (first->placement || first->raw_cap == 0) return false;
+    if ((uint32_t)count > first->prefill_cap) return false;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+
+    /* Router hash routing reads the token ids from the shared prefill-tokens
+     * buffer. */
+    int32_t *router_tokens = xmalloc((size_t)count * sizeof(*router_tokens));
+    if (!router_tokens) return false;
+    for (int i = 0; i < count; i++) router_tokens[i] = items[i].token;
+    bool ok = ds4_gpu_tensor_write(metal_graph_prefill_tokens(first), 0,
+                                   router_tokens,
+                                   (uint64_t)count * sizeof(*router_tokens)) != 0;
+    free(router_tokens);
+
+    /* Embed each session's token (M=1). */
+    for (int i = 0; ok && i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        metal_graph_dspark_capture_begin(g);
+        ok = ds4_gpu_embed_token_hc_tensor(
+                metal_graph_cur_hc(g),
+                model->map,
+                model->size,
+                weights->token_embd->abs_offset,
+                (uint32_t)weights->token_embd->dim[1],
+                (uint32_t)items[i].token,
+                DS4_N_EMBD,
+                DS4_N_HC) != 0;
+    }
+
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* Per-session attention + output projection up to the FFN. */
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            ds4_gpu_graph *g = &s->graph;
+            const uint32_t pos = (uint32_t)s->checkpoint.len;
+            const uint32_t raw_row = pos % g->raw_cap;
+            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+            ok = metal_graph_encode_decode_layer_phase(
+                    g,
+                    model,
+                    &weights->layer[il],
+                    il,
+                    pos,
+                    g->layer_raw_cache[il],
+                    g->raw_cap,
+                    raw_row,
+                    n_raw,
+                    items[i].token,
+                    METAL_DECODE_LAYER_TO_FFN);
+        }
+
+        /* Gather the N after-attn HC rows into the shared batch buffer. */
+        for (int i = 0; ok && i < count; i++) {
+            ds4_gpu_graph *srcg = &items[i].session->graph;
+            ds4_gpu_tensor dst_row;
+            ok = metal_graph_borrow_tensor_view(
+                         &dst_row,
+                         metal_graph_batch_after_attn_hc(first),
+                         (uint64_t)i * hc_bytes,
+                         hc_bytes) &&
+                 ds4_gpu_tensor_copy_xdev_default(
+                         &dst_row,
+                         metal_graph_after_attn_hc(srcg),
+                         hc_bytes) != 0;
+        }
+
+        /* The whole FFN (norm + router + MoE + shared + expand) at M=N. */
+        if (ok) {
+            ok = metal_graph_encode_layer_ffn_batch(
+                    first, model, &weights->layer[il], il, 0,
+                    (uint32_t)count, NULL, 0);
+        }
+
+        /* Scatter the FFN output back into each session and advance. */
+        for (int i = 0; ok && i < count; i++) {
+            ds4_gpu_graph *srcg = &items[i].session->graph;
+            ds4_gpu_tensor src_row;
+            ok = metal_graph_borrow_tensor_view(
+                         &src_row,
+                         metal_graph_batch_next_hc(first),
+                         (uint64_t)i * hc_bytes,
+                         hc_bytes) &&
+                 ds4_gpu_tensor_copy_xdev_default(
+                         metal_graph_after_ffn_hc(srcg),
+                         &src_row,
+                         hc_bytes) != 0;
+            if (ok) {
+                ds4_gpu_tensor *tmp = metal_graph_cur_hc(srcg);
+                srcg->cur_hc_by_tier[srcg->active_tier] =
+                    metal_graph_after_ffn_hc(srcg);
+                srcg->after_ffn_hc_by_tier[srcg->active_tier] = tmp;
+                ok = metal_graph_dspark_capture_decode_layer(srcg, il);
+            }
+        }
+    }
+
+    /* Each session's own output head (the logits). */
+    for (int i = 0; ok && i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        ok = metal_graph_encode_output_head(g, model, weights,
+                                            weights->output->dim[1]);
+    }
+    return ok;
+}
+
 static bool metal_graph_encode_session_pipeline_batch(
         ds4_decode_item *items,
         int count,
@@ -66493,8 +66618,16 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
         const char *interleave = getenv("DS4_CUDA_SESSION_BATCH_INTERLEAVE");
         const bool use_pipeline = !interleave || !interleave[0] ||
                                   strcmp(interleave, "0") != 0;
+        const char *single_gpu = getenv("DS4_CUDA_SESSION_BATCH_SINGLE_GPU");
+        const bool use_single_gpu_ffn = single_gpu && single_gpu[0] &&
+                                        strcmp(single_gpu, "0") != 0;
         if (ok && use_pipeline && first->graph.placement) {
             ok = metal_graph_encode_session_pipeline_batch(
+                    items, count, &e->model, &e->weights);
+        } else if (ok && use_single_gpu_ffn && !first->graph.placement &&
+                   count >= 2 &&
+                   (uint32_t)count <= first->graph.prefill_cap) {
+            ok = metal_graph_encode_session_batch_single_gpu(
                     items, count, &e->model, &e->weights);
         } else {
             for (int i = 0; ok && i < count; i++) {
