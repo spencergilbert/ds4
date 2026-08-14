@@ -442,6 +442,13 @@ is the stream overlap; the FFN grouping stays env-gated off.
   the added LDS traffic offsets the saved VALU. The q8 GEMMs are
   MMA-issue-bound, not dequant-bound -- the LUT lands but does not move the
   number.
+- **Sinkhorn hc_pre gap (closed 2026-08-14)**: the 48 ms/layer hc_pre was
+  the skinny HC projection -- the rms_norm is 11 ms and the
+  16384x24x20480 f16 GEMM (mix_hc=24) is 28 ms at 0.29 TFLOPS (the cublas
+  M=24 is too skinny to fill tiles). A WMMA kernel (tokens in M, the 24
+  outputs in two N-tiles) measures 16.1 vs 26.4 ms (1.64x); landed as
+  matmul_f16_skinny_wmma_kernel, 64K 247.3 -> 250.5 t/s (+1.3%), logits
+  argmax/top-5 stable (fp16 accumulation-order class).
 
 
 

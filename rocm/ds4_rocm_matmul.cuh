@@ -801,6 +801,72 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand rows launch");
 }
 
+/* Skinny-output f16 GEMM (out_dim <= 32) via WMMA.  The cublas path for
+ * the HC projection (16384 x 24 x 20480, the mix_hc=24 projection) runs at
+ * ~0.29 TFLOPS because the M=24 dimension is too skinny to fill the tiles;
+ * this kernel puts the tokens in the M dimension (128/block, 16/warp) and the
+ * 24 outputs in two N-tiles, measured 16.1 vs 26.4 ms (1.64x).  The fp16 A/B
+ * rounding matches the cublas path (both convert the activations to fp16). */
+__global__ static void matmul_f16_skinny_wmma_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint32_t n_tok,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    constexpr uint32_t M_TILE = 128u;
+    constexpr uint32_t K_TILE = 32u;
+    const uint32_t block_t = blockIdx.x * M_TILE;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    __shared__ __half xs[M_TILE][K_TILE];
+    __shared__ __half ws[32][K_TILE];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
+    wmma::fill_fragment(acc0, 0.0f);
+    wmma::fill_fragment(acc1, 0.0f);
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += K_TILE) {
+        for (uint32_t j = tid; j < M_TILE * K_TILE; j += 256u) {
+            const uint32_t t = j / K_TILE;
+            const uint32_t k = j - t * K_TILE;
+            const uint32_t tok = block_t + t;
+            xs[t][k] = (tok < n_tok)
+                ? __float2half(x[(uint64_t)tok * in_dim + k0 + k])
+                : __float2half(0.0f);
+        }
+        for (uint32_t j = tid; j < 32u * K_TILE; j += 256u) {
+            const uint32_t r = j / K_TILE;
+            const uint32_t k = j - r * K_TILE;
+            ws[r][k] = (r < out_dim)
+                ? w[(uint64_t)r * in_dim + k0 + k]
+                : __float2half(0.0f);
+        }
+        __syncthreads();
+        for (uint32_t kk = 0; kk < K_TILE; kk += 16u) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+            wmma::load_matrix_sync(a, &xs[warp * 16u][kk], K_TILE);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b0, b1;
+            wmma::load_matrix_sync(b0, &ws[0][kk], K_TILE);
+            wmma::load_matrix_sync(b1, &ws[16][kk], K_TILE);
+            wmma::mma_sync(acc0, a, b0, acc0);
+            wmma::mma_sync(acc1, a, b1, acc1);
+        }
+        __syncthreads();
+    }
+    for (uint32_t nt = 0; nt < 2u; nt++) {
+#pragma unroll
+        for (uint32_t e = 0; e < 8u; e++) {
+            const uint32_t t = warp * 16u + 2u * e + (lane >> 4u);
+            const uint32_t r = nt * 16u + (lane & 15u);
+            const uint32_t tok = block_t + t;
+            if (tok < n_tok && r < out_dim) {
+                out[(uint64_t)tok * out_dim + r] =
+                    (nt == 0u ? acc0 : acc1).x[e];
+            }
+        }
+    }
+}
+
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map ||
         in_dim == 0u || out_dim == 0u || n_tok == 0u ||
@@ -817,6 +883,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const __half *w = (const __half *)wptr;
     const int ordered_decode = n_tok == 1u;
     if (g_cublas_ready && n_tok > 1) {
+        if (out_dim <= 32u && (in_dim & 15u) == 0u && n_tok >= 128u) {
+            matmul_f16_skinny_wmma_kernel<<<(n_tok + 127u) / 128u, 256, 0, g_compute_stream>>>(
+                    (float *)out->ptr, w, (const float *)x->ptr,
+                    (uint32_t)n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_f16 skinny wmma launch");
+        }
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
