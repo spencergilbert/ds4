@@ -4931,6 +4931,23 @@ static bool cuda_q8_prequant_decode_enabled(void) {
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
+    /* The resident-mode cache is normally unlimited (the tensors are only a
+     * ~10.6 GiB acceleration path), but an explicit cap lets a long-context
+     * session trade some q8 GEMM speed for device headroom. */
+    const char *renv = getenv("DS4_ROCM_Q8_F16_CACHE_GB");
+    if (renv && renv[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long gib = strtoull(renv, &end, 10);
+        if (end != renv && *end == '\0' && errno == 0 &&
+            gib <= UINT64_MAX / 1073741824ull) {
+            return (uint64_t)gib * 1073741824ull;
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "invalid DS4_ROCM_Q8_F16_CACHE_GB=%s; "
+                "using automatic q8 fp16 cache limit\n",
+                renv);
+    }
     if (!g_ssd_streaming_mode) return UINT64_MAX;
     const char *env = getenv("DS4_ROCM_STREAM_Q8_F16_CACHE_GB");
     if (env && env[0]) {

@@ -507,6 +507,11 @@ slightly except the first):
   the boundary).
 - **q8→fp16 cache partial yield** at session create: up to −10.6 GiB but
   prefill drops toward 148 t/s (measured −41% with the cache disabled).
+  **Measured the partial-yield curve (2026-08-14, `DS4_ROCM_Q8_F16_CACHE_GB`
+  cap)**: 8 GiB −15%, 6 GiB −23%, 4 GiB −31%, 2 GiB −37%, 0 −42% at the
+  32K prefill (262 -> 151 t/s) -- ~5.8% per GiB. Far too expensive for the
+  384K-16K (+1.5%) or the 1M@8192 (+5-6%) headroom; the fp16-KV flag
+  (−5.25 GiB at −6%, ~1.1%/GiB) is the better memory lever.
 
 ### Not needed
 
