@@ -722,6 +722,12 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
     ds4_q8_float8_t acc3 = acc0;
 
     __shared__ _Float16 lds_x[N_TILE * K_TILE];
+    /* 256-entry int8->fp16 lookup (bit-exact (_Float16)(float)(int8_t)): the
+     * per-element VALU I2F+F2F conversion becomes one LDS load per weight. */
+    __shared__ _Float16 s_lut[256];
+    for (uint32_t i = tid; i < 256u; i += blockDim.x) {
+        s_lut[i] = (_Float16)(float)(int8_t)(uint8_t)i;
+    }
 
     for (uint32_t bi = 0; bi < n_blocks; bi++) {
         for (uint32_t j = tid; j < N_TILE * K_TILE; j += blockDim.x) {
@@ -748,8 +754,8 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         ds4_q8_half16_t a1;
 #pragma unroll
         for (uint32_t i = 0; i < 16u; i++) {
-            a0[i] = sc * (_Float16)(float)(int)w0[i];
-            a1[i] = sc * (_Float16)(float)(int)w1[i];
+            a0[i] = sc * s_lut[(uint8_t)w0[i]];
+            a1[i] = sc * s_lut[(uint8_t)w1[i]];
         }
 
 #pragma unroll
