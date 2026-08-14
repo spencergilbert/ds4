@@ -423,6 +423,17 @@ attention -- the remaining hard part (per-session KV/comp caches and
 positions). The FFN grouping's gather/scatter + FFN-batch orchestration is
 reusable scaffolding for that.
 
+**Multi-stream resolution (2026-08-14, `245f6cf`)**: the actual lever was
+the multi-stream concurrency, not the M=N batching. The batched decode now
+runs each session's per-token chain on its own non-blocking stream (a
+settable g_compute_stream passed as the 4th <<<>>> arg across 326 launch
+sites, per-stream cublas handles + temp scratch -- the shared handle/scratch
+raced under concurrency and produced garbage until isolated). Measured 4
+concurrent clients 14.9 vs 13.3 tok/s aggregate (+12%), bit-identical
+output. The M=N FFN grouping remains a net loss at realistic N (the M=N win
+needs ~64+ sessions for the full tiles), so the batched decode's real win
+is the stream overlap; the FFN grouping stays env-gated off.
+
 
 
 ### 1. Indexer top-k kernel (DONE 2026-08-10)
