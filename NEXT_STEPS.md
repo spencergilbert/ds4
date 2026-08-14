@@ -212,6 +212,17 @@ Working on ds4 (DeepSeek V4 Flash inference engine) on a Strix Halo machine:
    not reorder the per-token K accumulation). mt=16 measured worse (447
    ms). Decode unchanged (the decode's experts are all below the count>=8
    hot threshold -- the scalar path).
+   **Update 4 (`f882095`)**: the 8192-token chunk is now the default
+   through 768K. The fp16 scores (`d3972b2`) halved the comp_cap x pc
+   buffer, bringing the 768K@8192 session to 119.25 GiB (4.75 free) --
+   the prefill runs (99.65 t/s full-prompt, no OOM). The 1M@8192 still
+   does not fit (129.8 GiB total vs the 124 GTT: the model 80.76 + kv
+   14.11 + buffers 18.11 + the ~17 GB allocator overhead), so >768K keeps
+   the 4096 chunk. Explored and closed this session: the cublas temp's
+   managed-GTT fallback (the GTT is also exhausted -- the fallback still
+   OOMs), and the batch-q/heads fp16 (-2.1 GB -- insufficient alone: the
+   1M@8192 needs ~6 GB; the only sufficient single lever remains the fp16
+   compressed-KV flag, at its net-zero speed trade).
 
 2. **MoE prefill kernels (DONE 2026-08-11, `a8a74d7`)** — the routed MoE is the
    biggest per-layer cost (~43-49%); for agentic turn prefill (small token
