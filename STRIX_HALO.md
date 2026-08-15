@@ -156,6 +156,29 @@ rm -f /tmp/ds4.lock   # clear a stale lock from a killed run
 (Do not run two ds4 processes concurrently — there is a single-instance
 lock; kill a hung run with `pkill -9 -f ds4-bench; rm -f /tmp/ds4.lock`.)
 
+### Run as a service (systemd)
+
+A user-service template + installer are in `systemd/`. Install and start:
+
+```sh
+./systemd/install.sh
+```
+
+That rewrites the placeholders in `systemd/ds4-server.service` with your repo
+path and model (defaults: `--ctx 131072 --batched-session 4`, the
+`~/.cache/ds4/models/...` model) and installs it to
+`~/.config/systemd/user/ds4-server.service`, with `Restart=on-failure`,
+a stale-lock cleanup, and a 120G cgroup cap. Override defaults with env vars:
+
+```sh
+DS4_CTX=65536 DS4_BATCH=2 DS4_MODEL=/path/to/model.gguf ./systemd/install.sh
+INSTALL_ONLY=1 ./systemd/install.sh   # copy + daemon-reload, don't start
+```
+
+Enable lingering so it survives logout (`loginctl enable-linger "$USER"`), and
+inspect with `systemctl --user status ds4-server.service` / `journalctl --user
+-u ds4-server`.
+
 ## 7. Memory / throughput tradeoff knobs
 
 Only flip these if a specific long-context session needs the extra headroom —

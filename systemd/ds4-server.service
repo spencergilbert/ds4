@@ -1,0 +1,53 @@
+# DS4 inference server on Strix Halo (ROCm / gfx1151).
+#
+# User service.  Install it with systemd/install.sh, which rewrites the
+# __DS4_DIR__ / __MODEL__ / __CTX__ / __BATCH__ placeholders and copies the
+# result to ~/.config/systemd/user/ds4-server.service.  Then:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ds4-server.service
+#   systemctl --user status ds4-server.service
+#
+# To survive logout without a login session, enable lingering:
+#   loginctl enable-linger "$USER"
+#
+# The ROCm backend runs the fast path by default: adaptive 16K/8K/4K prefill
+# chunks, fp16 indexer scores, MoE 8-warp WMMA, WMMA decode score + HC
+# projection, and multi-stream batched decode.  See STRIX_HALO.md "Run DS4
+# optimally" for the knobs and the memory/throughput tradeoff flags.
+
+[Unit]
+Description=DS4 inference server (ROCm / Strix Halo)
+Documentation=file:__DS4_DIR__/STRIX_HALO.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DS4_DIR__
+
+# Stale single-instance lock from a killed run (DS4 takes /tmp/ds4.lock).
+ExecStartPre=-/bin/rm -f /tmp/ds4.lock
+ExecStartPre=-/bin/mkdir -p %h/.cache/ds4/kv
+
+# Optional memory / throughput levers (see STRIX_HALO.md "Memory /
+# throughput tradeoff knobs").  Uncomment only if a specific long-context
+# session needs the headroom -- each has a measured prefill cost.
+# Environment=DS4_GPU_ATTN_COMP_CACHE_F16=1
+# Environment=DS4_ROCM_Q8_F16_CACHE_GB=10
+# Environment=DS4_CUDA_SESSION_BATCH_MULTI_STREAM=0
+
+ExecStart=__DS4_DIR__/ds4-server --rocm -m __MODEL__ --ctx __CTX__ --batched-session __BATCH__ --host 127.0.0.1 --port 8000 --kv-disk-dir %h/.cache/ds4/kv --kv-disk-space-mb 8192
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+# The Strix Halo box has 128 GB RAM: cap the service so an OOM kills this
+# cgroup rather than the whole machine.  Memory scales with
+# --ctx x --batched-session (131072 x 4 is ~123 GiB); drop one or both if the
+# cgroup is OOM-killed.  Remove this line if the user manager does not
+# delegate the memory controller.
+MemoryMax=120G
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
