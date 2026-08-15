@@ -100,10 +100,75 @@ DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 Avoid mixed IQ2/IQ4 or IQ2/Q4 GGUFs on this machine — they put more memory
 pressure on the ROCm path and can trigger system OOM.
 
-## 6. Run DS4
+## 6. Run DS4 optimally (current best-known settings)
+
+Every prefill/decode optimization ships **on by default** — no flags or env
+vars are needed for the fast path:
+
+- **Adaptive prefill chunk** from the context size: 16384 tokens ≤ 256K,
+  8192 for 256K–768K, 4096 ≥ 768K (the longer the prompt, the bigger the
+  chunk, up to the memory budget).
+- **fp16 indexer-scores buffer** (halves the top-k score reads) and the
+  **MoE WMMA 8-warp hotlist** — always on.
+- **WMMA per-token decode score** (3× the scalar indexer score) — always on.
+- **WMMA skinny HC projection** (the `mix_hc`=24 GEMM, 1.6×) — always on.
+- **Multi-stream batched decode** — on when the server runs with
+  `--batched-session N` (per-session streams overlap the latency-bound M=1
+  kernels across concurrent sessions).
+
+Measured throughput on this machine (prefill t/s): 4112 → 245, 64K → 250,
+128K → 217, 384K → 149; decode ≈ 14.8 t/s single-session, ≈ 14.9 t/s
+aggregate with four concurrent sessions.
+
+The ROCm backend is selected automatically; the model path is
+`~/.cache/ds4/models/`.
+
+### Interactive / one-shot
 
 ```sh
-./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+./ds4 -m ~/.cache/ds4/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 ```
 
-The ROCm build uses the Strix Halo backend automatically.
+### Server (OpenAI-compatible API, batched decode)
+
+```sh
+./ds4-server --rocm \
+  -m ~/.cache/ds4/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --ctx 131072 \
+  --batched-session 4 \
+  --host 127.0.0.1 --port 8000
+```
+
+`--batched-session N` keeps N resident sessions and batches decode-ready
+requests across them on separate streams (the multi-stream overlap). N=4 is
+the practical ceiling before per-session memory OOMs — use the largest N the
+context budget allows.
+
+### Benchmark / regression check
+
+```sh
+rm -f /tmp/ds4.lock   # clear a stale lock from a killed run
+./ds4-bench -m ~/.cache/ds4/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --prompt-file /tmp/promessi_x6.txt \
+  --ctx-start 65536 --ctx-max 65536 --ctx-alloc 65538 --gen-tokens 0
+```
+
+(Do not run two ds4 processes concurrently — there is a single-instance
+lock; kill a hung run with `pkill -9 -f ds4-bench; rm -f /tmp/ds4.lock`.)
+
+## 7. Memory / throughput tradeoff knobs
+
+Only flip these if a specific long-context session needs the extra headroom —
+each has a measured prefill cost:
+
+| env var | effect | cost |
+|---|---|---|
+| `DS4_GPU_ATTN_COMP_CACHE_F16=1` | fp16 compressed-KV cache: −5.25 GiB @1M | ~−6% prefill |
+| `DS4_ROCM_Q8_F16_CACHE_GB=N` | cap the q8→fp16 cache (default unlimited ~10.6 GiB) | ~5.8% prefill per GiB yielded |
+| `DS4_CUDA_SESSION_BATCH_MULTI_STREAM=0` | disable the batched-decode stream overlap | −12% concurrent throughput |
+| `DS4_CUDA_SESSION_BATCH_SINGLE_GPU=1` | opt-in FFN M=N grouping | net loss at N≤16 — leave off |
+
+The 1M-token context (pc=4096) fits with no flags (~119.3 GiB used, ~4.7 GiB
+free); the 8192-token chunk at 1M does not fit. The `DS4_GPU_ATTN_COMP_CACHE_F16=1`
+flag is the cheapest per-GiB lever if a 1M@8192 session is ever required
+(net-zero with the 8192-chunk gain).
