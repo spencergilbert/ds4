@@ -324,6 +324,21 @@ d897da4 bench: add AMD Strix Halo resident and SSD streaming results
 de65cae makefile adjustments for fedora44 build
 ```
 
+## DSpark Speculative Decoding (2026-08-18, post-upstream-merge)
+
+Merged upstream `main` through `84cc882` (`rocm: enable DSpark speculative
+decoding`). DSpark is opt-in via `--mtp <support.gguf> --dspark`; the support
+GGUF (~5.6 GiB) is `DeepSeek-V4-Flash-DSpark-support-0731.gguf`
+(`./download_model.sh ds4f-dspark`). Flags: `--dspark`,
+`--dspark-confidence F` (default 0.7 on ROCm/CUDA), `--dspark-strict`
+(target-only decode for reproducibility checks).
+
+Short-context greedy measurement on Strix Halo (ctx 32768) shows DSpark
+*slower* than ordinary decode here: code 14.8 vs 17.2 t/s, a one-word
+factual prompt 10.4 vs 17.0 t/s. The draft + verification overhead only
+amortizes on longer, highly predictable continuations. Run commands in
+STRIX_HALO.md §6; full DSpark contract in README.md.
+
 ## WMMA two-pass indexed attention (2026-08-11)
 
 `attention_indexed_mixed_heads16_wmma_kernel` replaces the online kernel on

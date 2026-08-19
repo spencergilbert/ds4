@@ -35,6 +35,11 @@ ExecStartPre=-/bin/mkdir -p %h/.cache/ds4/kv
 # Environment=DS4_GPU_ATTN_COMP_CACHE_F16=1
 # Environment=DS4_ROCM_Q8_F16_CACHE_GB=10
 # Environment=DS4_CUDA_SESSION_BATCH_MULTI_STREAM=0
+#
+# Optional DSpark speculative decoding (see STRIX_HALO.md "DSpark
+# speculative decoding"): append to ExecStart
+#   --dspark --mtp %h/.cache/ds4/models/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+# (opt-in; on short prompts it measured slower than ordinary decode here.)
 
 ExecStart=__DS4_DIR__/ds4-server --rocm -m __MODEL__ --ctx __CTX__ --batched-session __BATCH__ --host 127.0.0.1 --port 8000 --kv-disk-dir %h/.cache/ds4/kv --kv-disk-space-mb 8192
 

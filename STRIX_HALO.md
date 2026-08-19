@@ -100,6 +100,13 @@ DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 Avoid mixed IQ2/IQ4 or IQ2/Q4 GGUFs on this machine — they put more memory
 pressure on the ROCm path and can trigger system OOM.
 
+Optional DSpark speculative decoding (see §6) also needs its own ~5.6 GiB
+support GGUF, downloaded once:
+
+```sh
+DS4_GGUF_DIR=~/.cache/ds4/models ./download_model.sh ds4f-dspark
+```
+
 ## 6. Run DS4 optimally (current best-known settings)
 
 Every prefill/decode optimization ships **on by default** — no flags or env
@@ -128,6 +135,34 @@ The ROCm backend is selected automatically; the model path is
 ```sh
 ./ds4 -m ~/.cache/ds4/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 ```
+
+### DSpark speculative decoding (optional)
+
+DSpark drafts up to five future tokens with a small auxiliary model and
+verifies them against the main model's hidden states (the main model stays
+authoritative). Opt-in and experimental; it does not accelerate prefill.
+
+```sh
+./ds4 --rocm --dspark \
+  -m ~/.cache/ds4/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --mtp ~/.cache/ds4/models/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+```
+
+| flag | effect |
+|---|---|
+| `--mtp FILE` | load the support GGUF (DSpark or legacy MTP); required |
+| `--dspark` | enable the DSpark runtime |
+| `--dspark-confidence F` | enable DSpark with a confidence-pruning threshold 0..1 (implies `--dspark`); default 0.7 on ROCm/CUDA |
+| `--dspark-strict` | load the support model but keep target-only decode (reproducibility checks) |
+
+The win is prompt- and length-dependent. On this machine, short greedy runs
+measured *slower* than ordinary decode (code: 14.8 vs 17.2 t/s; a one-word
+factual prompt: 10.4 vs 17.0 t/s at ctx 32768) — the draft + verification
+overhead only amortizes on longer, highly predictable continuations.
+Benchmark your own workload before enabling it; `--temp 0` is only for
+verifying that DSpark preserves greedy output. The support model adds
+~5.6 GiB resident memory and is checkpoint-specific — pair it only with the
+0731 Flash model, never DeepSeek V4 PRO.
 
 ### Server (OpenAI-compatible API, batched decode)
 
