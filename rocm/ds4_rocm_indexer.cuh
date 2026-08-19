@@ -616,10 +616,15 @@ __global__ static void dspark_markov_argmax_kernel(
             const unsigned char *qblock = row + (uint64_t)block * 34u;
             const float scale = __half2float(*(const __half *)qblock);
             const int8_t *quants = (const int8_t *)(qblock + 2u);
+            const float *st = state + block * 32u;
             float sum = 0.0f;
 #pragma unroll
-            for (uint32_t lane = 0; lane < 32u; lane++) {
-                sum += (float)quants[lane] * state[block * 32u + lane];
+            for (uint32_t lane = 0; lane < 32u; lane += 4u) {
+                const float4 sv = *(const float4 *)(st + lane);
+                sum += (float)quants[lane + 0u] * sv.x +
+                       (float)quants[lane + 1u] * sv.y +
+                       (float)quants[lane + 2u] * sv.z +
+                       (float)quants[lane + 3u] * sv.w;
             }
             acc += scale * sum;
         }
