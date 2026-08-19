@@ -42,9 +42,14 @@ Draft propose breakdown (`DS4_DSPARK_STAGE_PROFILE=1` + stats), per cycle:
    required), but the payoff is small.
 
 2. The real overhead is the **shared main-model kernels running at tiny batch**:
-   - **Verification** runs the full 43-layer model at M=5 and costs ~98 ms/token
-     vs ~55 ms/token for the M=1 decode path — the batch path is 1.8x *worse*
-     per token. 11.3 s of the 13.5 s overhead.
+   - **Verification** runs the full 43-layer model at M=5. Measured with
+     `--dspark-confidence 0` (fixed 5-token blocks): 271 ms per 5-token verify
+     = 54.2 ms/token — exactly the M=1 cost (54.6 ms/token), *not* faster.
+     Since a verify costs the same as decoding the tokens normally, DSpark can
+     only win if the small-batch (M<=16) path becomes *cheaper* per token than
+     M=1 (currently the batch kernels are launch-latency-bound at M=5, no more
+     efficient than the per-token WMMA decode path). 11.3 s of the 13.5 s
+     overhead, and it is the *only* thing that can make DSpark a win.
    - **Draft FFN** runs the full 256-expert routed MoE at M=6 (`routed_moe`
      is ~5.5 ms of a ~7.5 ms FFN even at M=14).
    - **Draft final head** computes 128K-vocab logits at M=6 (10.9 ms/cycle).
@@ -72,9 +77,13 @@ Draft propose breakdown (`DS4_DSPARK_STAGE_PROFILE=1` + stats), per cycle:
 - [ ] **Stage-chain overhead**: reduce `cudaDeviceSynchronize()` count in the
       propose path (share one command buffer where the CPU does not need the
       result), and check the draft-token upload path for synchronous copies.
-- [ ] **Verification M=5 path**: investigate why `metal_graph_encode_layer_batch`
-      is 1.8x slower per token than M=1 (batch score/attention kernels vs the
-      per-token WMMA score path) — the single biggest lever.
+- [ ] **Verification M=5 path**: the verify costs 54.2 ms/token (measured with
+      `--dspark-confidence 0`), equal to M=1 — DSpark can only win if the
+      small-batch (M<=16) layer encode becomes *cheaper* per token than M=1.
+      This is the same small-batch path the draft uses; it is launch-latency-
+      bound (batch score/attention + batch MoE kernels are tuned for large M,
+      while M=1 has the per-token WMMA score fast path). The single biggest
+      lever, and the one that decides whether DSpark can ever win on ROCm.
 - [ ] **Draft final head @ M=6**: check the 128K-vocab output matmul dispatch.
 - [ ] **Draft routed MoE @ M=6**: check the small-batch hotlist config.
 
