@@ -69,21 +69,28 @@ Draft propose breakdown (`DS4_DSPARK_STAGE_PROFILE=1` + stats), per cycle:
       state loads. Bit-exact (identical proposals/acceptance), but **neutral**
       (55.62 → 55.27 ms over a 256-token run, −0.6%): the kernel is bound by
       re-reading the 34.8 MB markov W2 matrix from DRAM once per proposed
-      token, not by the ALU dot. The real fix is amortizing W2 across the
-      draft's sequential token proposals (one read per cycle instead of per
-      token), which needs a cooperative-kernel or multi-pass caller restructure.
+      token, not by the ALU dot.
+- [x] **Small-batch q8 token tile** (the first real win): the q8 GEMM and the
+      grouped-q8 attention output hardcoded a 32-token tile, so M=5-6 batches
+      staged 5-6x the rows they used. Sized the tile to the batch
+      (2/4/8/16/32), bit-exact. Measured on the 256-token DSpark code task
+      (16K ctx): prop_logits 553 → 296 ms (−47%), verify_layer 11164 → 9161 ms
+      (−18%), net_saved −9726 → −7245 ms, generation 9.29 → 10.21 t/s (+10%).
+      64K prefill unchanged (250 t/s). The grouped-q8 attention-output tile
+      is neutral on this benchmark (not a bottleneck there).
 - [ ] **Non-causal attention kernel**: tile the score computation (shared-memory
       staging, vectorized dot) instead of the per-thread full-K loop.
 - [ ] **Stage-chain overhead**: reduce `cudaDeviceSynchronize()` count in the
       propose path (share one command buffer where the CPU does not need the
       result), and check the draft-token upload path for synchronous copies.
-- [ ] **Verification M=5 path**: the verify costs 54.2 ms/token (measured with
-      `--dspark-confidence 0`), equal to M=1 — DSpark can only win if the
-      small-batch (M<=16) layer encode becomes *cheaper* per token than M=1.
-      This is the same small-batch path the draft uses; it is launch-latency-
-      bound (batch score/attention + batch MoE kernels are tuned for large M,
-      while M=1 has the per-token WMMA score fast path). The single biggest
-      lever, and the one that decides whether DSpark can ever win on ROCm.
+- [ ] **Verification M=5 path**: after the small-batch q8 tile fix the verify
+      is 9161 ms / 115 tokens = 79.6 ms/token (fixed M=5 ≈ 44 ms/token, now
+      *cheaper* than M=1's 54.6 ms/token). Remaining verify cost is the
+      routed-MoE hotlist at M=5 (~2 ms/layer), the HC split/sinkhorn, and the
+      score/attention -- all launch-latency-bound tiny kernels. Note the
+      binding constraint is now the acceptance rate (0.29 tokens/cycle): a
+      5-token verify (222 ms) only saves ~79 ms of accepted-token value, so
+      kernel work alone cannot make DSpark a win.
 - [ ] **Draft final head @ M=6**: check the 128K-vocab output matmul dispatch.
 - [ ] **Draft routed MoE @ M=6**: check the small-batch hotlist config.
 
