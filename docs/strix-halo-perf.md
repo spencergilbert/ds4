@@ -335,9 +335,14 @@ GGUF (~5.6 GiB) is `DeepSeek-V4-Flash-DSpark-support-0731.gguf`
 
 Short-context greedy measurement on Strix Halo (ctx 32768) shows DSpark
 *slower* than ordinary decode here: code 14.8 vs 17.2 t/s, a one-word
-factual prompt 10.4 vs 17.0 t/s. The draft + verification overhead only
-amortizes on longer, highly predictable continuations. Run commands in
-STRIX_HALO.md §6; full DSpark contract in README.md.
+factual prompt 10.4 vs 17.0 t/s. A realistic 256-token code task confirms
+it: 10.0 vs 16.2 t/s (ctx 32K) and 9.3 vs 14.4 t/s on a ~16K-token code
+session. `DS4_DSPARK_STATS=1` pins the cause to low draft acceptance:
+avg 0.29 accepted tokens/cycle (146/192 cycles no draft) with net −9.7 s
+over 256 tokens — the propose + batch-verification overhead outweighs the
+saved tokens. The README's speculative win is a Metal result; the ROCm
+DSpark path (enabled upstream in 84cc882) is not yet a win on this machine.
+Run commands in STRIX_HALO.md §6; full DSpark contract in README.md.
 
 ## WMMA two-pass indexed attention (2026-08-11)
 

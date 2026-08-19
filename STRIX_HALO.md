@@ -155,14 +155,25 @@ authoritative). Opt-in and experimental; it does not accelerate prefill.
 | `--dspark-confidence F` | enable DSpark with a confidence-pruning threshold 0..1 (implies `--dspark`); default 0.7 on ROCm/CUDA |
 | `--dspark-strict` | load the support model but keep target-only decode (reproducibility checks) |
 
-The win is prompt- and length-dependent. On this machine, short greedy runs
-measured *slower* than ordinary decode (code: 14.8 vs 17.2 t/s; a one-word
-factual prompt: 10.4 vs 17.0 t/s at ctx 32768) — the draft + verification
-overhead only amortizes on longer, highly predictable continuations.
-Benchmark your own workload before enabling it; `--temp 0` is only for
-verifying that DSpark preserves greedy output. The support model adds
-~5.6 GiB resident memory and is checkpoint-specific — pair it only with the
-0731 Flash model, never DeepSeek V4 PRO.
+The win is prompt- and length-dependent, and on this machine it has not
+materialized in realistic single-session tests — DSpark measured consistently
+slower than ordinary greedy decode:
+
+| workload | ordinary | DSpark |
+|---|---|---|
+| code task, 256 tok, ctx 32K | 16.2 t/s | 10.0 t/s |
+| code session (~16K-token ctx) + 256 tok | 14.4 t/s | 9.3 t/s |
+| one-word factual, ctx 32K | 17.0 t/s | 10.4 t/s |
+
+Draft acceptance is the bottleneck: `DS4_DSPARK_STATS=1` reports ~0.29
+average accepted tokens/cycle on the 256-token code task (146 of 192 cycles
+produced no draft at all), so the propose + batch-verification overhead
+outweighs the saved tokens (net −9.7 s over 256 tokens). The speculative win
+the README describes is a Metal result; the ROCm DSpark path (just enabled
+upstream) is not yet a win here. Benchmark your own workload before enabling
+it; `--temp 0` is only for verifying that DSpark preserves greedy output.
+The support model adds ~5.6 GiB resident memory and is checkpoint-specific —
+pair it only with the 0731 Flash model, never DeepSeek V4 PRO.
 
 ### Server (OpenAI-compatible API, batched decode)
 
