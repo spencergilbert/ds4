@@ -4840,11 +4840,177 @@ static void ds4_unterminated_reasoning_before_tool(const char *text,
     *content_out = xstrdup("");
 }
 
-static bool parse_deepseek_generated_message_ex(const char *text,
-                                                bool require_thinking_closed,
-                                                char **content_out,
-                                                char **reasoning_out,
-                                                tool_calls *calls) {
+/* DSML comes in several tag spellings: " DSML｜", "DSML｜", plain
+ * <tool_calls>, and the singular <tool_call>.  The strict per-flavor parse
+ * requires every tag of a block to share one spelling, but local models
+ * legitimately drift between them: clients such as pi teach plain
+ * <invoke>/<parameter> in their tool schemas while the protocol teaches the
+ * " DSML｜"-prefixed spelling, and generations sometimes open with one
+ * spelling and close with another, or emit a stray closing tag ahead of the
+ * block (observed as "ignored orphan tool-call end marker" followed by a
+ * block that then fails the strict parse).  Before the strict parse we rewrite
+ * the tool-block region so every tag is in the canonical plain spelling.
+ * Thinking text, the pre-block assistant text, and parameter values are left
+ * untouched byte-for-byte, and the pass is skipped entirely when no non-plain
+ * spelling is present. */
+static const char *dsml_flavor_prefixes[] = { DS4_DSML, DS4_DSML_SHORT, "" };
+
+static bool dsml_flavor_tag(const char *p, const char *e,
+                            const char *kind, bool close, bool full,
+                            size_t *mlen) {
+    const char *op = close ? "</" : "<";
+    size_t oplen = close ? 2 : 1;
+    for (size_t i = 0; i < 3; i++) {
+        const char *f = dsml_flavor_prefixes[i];
+        size_t fl = strlen(f), kl = strlen(kind);
+        size_t base = oplen + fl + kl;
+        if ((size_t)(e - p) < base) continue;
+        if (strncmp(p, op, oplen) != 0) continue;
+        if (fl && strncmp(p + oplen, f, fl) != 0) continue;
+        if (strncmp(p + oplen + fl, kind, kl) != 0) continue;
+        if (full) {
+            if ((size_t)(e - p) < base + 1 || p[base] != '>') continue;
+            if (mlen) *mlen = base + 1;
+        } else if (mlen) {
+            *mlen = base;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool dsml_nonplain_tag_at(const char *p, const char *e) {
+    static const char *kinds[] = { "tool_calls", "invoke", "parameter" };
+    size_t ml = 0;
+    for (size_t k = 0; k < 3; k++) {
+        for (size_t f = 0; f < 2; f++) {  /* non-empty flavors: " DSML｜", "DSML｜" */
+            const char *fl = dsml_flavor_prefixes[f];
+            size_t fll = strlen(fl);
+            if (dsml_flavor_tag(p, e, kinds[k], false, false, &ml) &&
+                (size_t)(e - p) >= fll + 1 && !strncmp(p + 1, fl, fll))
+                return true;
+            if (dsml_flavor_tag(p, e, kinds[k], true, true, &ml) &&
+                (size_t)(e - p) >= fll + 2 && !strncmp(p + 2, fl, fll))
+                return true;
+        }
+    }
+    /* Plain singular <tool_call>/</tool_call>: the strict parser requires the
+     * plural close, so even plain singular tags need canonicalization. */
+    if (dsml_flavor_tag(p, e, "tool_call", false, true, &ml) ||
+        dsml_flavor_tag(p, e, "tool_call", true, true, &ml))
+        return true;
+    return false;
+}
+
+static bool dsml_region_needs_canonicalize(const char *p, const char *e) {
+    for (; p < e; p++) {
+        if (*p != '<') continue;
+        if (dsml_nonplain_tag_at(p, e)) return true;
+    }
+    return false;
+}
+
+/* First DSML block opener, honoring the same thinking boundary as the strict
+ * parser so DSML quoted inside reasoning never becomes executable. */
+static const char *dsml_first_block_opener(const char *text,
+                                           bool require_thinking_closed) {
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        const char *base = think_end ? think_end + 8 : text;
+        return find_any_tool_start(base);
+    }
+    return find_any_tool_start(text);
+}
+
+typedef enum {
+    DSML_CANON_BLOCK,
+    DSML_CANON_INVOKE,
+    DSML_CANON_PARAM,
+    DSML_CANON_TAIL,
+} dsml_canon_state;
+
+static const char *dsml_canon_copy_until_gt(buf *out, const char *p, const char *e) {
+    while (p < e && *p != '>') {
+        buf_putc(out, *p);
+        p++;
+    }
+    if (p < e && *p == '>') {
+        buf_putc(out, *p);
+        p++;
+    }
+    return p;
+}
+
+static void canonicalize_dsml_block_plain(const char *s, size_t len,
+                                          const char *region, buf *out) {
+    const char *e = s + len;
+    buf_append(out, s, (size_t)(region - s));
+    const char *p = region;
+    dsml_canon_state st = DSML_CANON_BLOCK;
+    size_t ml = 0;
+    while (p < e) {
+        if (st == DSML_CANON_BLOCK) {
+            if (dsml_flavor_tag(p, e, "tool_calls", false, true, &ml) ||
+                dsml_flavor_tag(p, e, "tool_call", false, true, &ml)) {
+                buf_puts(out, "<tool_calls>");
+                p += ml;
+            } else if (dsml_flavor_tag(p, e, "tool_calls", true, true, &ml) ||
+                       dsml_flavor_tag(p, e, "tool_call", true, true, &ml)) {
+                buf_puts(out, "</tool_calls>");
+                p += ml;
+                st = DSML_CANON_TAIL;
+            } else if (dsml_flavor_tag(p, e, "invoke", false, false, &ml)) {
+                buf_puts(out, "<invoke");
+                p += ml;
+                p = dsml_canon_copy_until_gt(out, p, e);
+                st = DSML_CANON_INVOKE;
+            } else {
+                buf_putc(out, *p);
+                p++;
+            }
+        } else if (st == DSML_CANON_INVOKE) {
+            if (dsml_flavor_tag(p, e, "invoke", true, true, &ml)) {
+                buf_puts(out, "</invoke>");
+                p += ml;
+                st = DSML_CANON_BLOCK;
+            } else if (dsml_flavor_tag(p, e, "parameter", false, false, &ml)) {
+                buf_puts(out, "<parameter");
+                p += ml;
+                p = dsml_canon_copy_until_gt(out, p, e);
+                st = DSML_CANON_PARAM;
+            } else {
+                buf_putc(out, *p);
+                p++;
+            }
+        } else if (st == DSML_CANON_PARAM) {
+            if (dsml_flavor_tag(p, e, "parameter", true, true, &ml)) {
+                buf_puts(out, "</parameter>");
+                p += ml;
+                st = DSML_CANON_INVOKE;
+            } else if ((p == s || isspace((unsigned char)p[-1]) || p[-1] == '>') &&
+                       dsml_flavor_tag(p, e, "parameter", false, false, &ml)) {
+                /* Nested <parameter> opened in tag position (loose XML drift). */
+                buf_puts(out, "<parameter");
+                p += ml;
+                p = dsml_canon_copy_until_gt(out, p, e);
+            } else {
+                /* Parameter value bytes kept verbatim, including any literal
+                 * angle-bracket text the value happens to contain. */
+                buf_putc(out, *p);
+                p++;
+            }
+        } else {
+            buf_putc(out, *p);
+            p++;
+        }
+    }
+}
+
+static bool parse_deepseek_generated_message_ex_core(const char *text,
+                                                     bool require_thinking_closed,
+                                                     char **content_out,
+                                                     char **reasoning_out,
+                                                     tool_calls *calls) {
     text = text ? text : "";
     const char *tool_search = text;
     bool recovered_unclosed_tool = false;
@@ -5031,6 +5197,26 @@ static bool parse_deepseek_generated_message_ex(const char *text,
         tool_calls_push(calls, tc);
         buf_free(&args);
     }
+}
+
+static bool parse_deepseek_generated_message_ex(const char *text,
+                                                bool require_thinking_closed,
+                                                char **content_out,
+                                                char **reasoning_out,
+                                                tool_calls *calls) {
+    text = text ? text : "";
+    const char *region = dsml_first_block_opener(text, require_thinking_closed);
+    if (region && dsml_region_needs_canonicalize(region, text + strlen(text))) {
+        buf canon = {0};
+        canonicalize_dsml_block_plain(text, strlen(text), region, &canon);
+        char *owned = buf_take(&canon);
+        bool ok = parse_deepseek_generated_message_ex_core(owned, require_thinking_closed,
+                                                           content_out, reasoning_out, calls);
+        free(owned);
+        return ok;
+    }
+    return parse_deepseek_generated_message_ex_core(text, require_thinking_closed,
+                                                    content_out, reasoning_out, calls);
 }
 
 static void trim_const_span(const char **start, const char **end) {
@@ -12085,10 +12271,10 @@ decode_again:
                 }
                 if (dsml_start) {
                     dsml_snippet_len = text.len - (dsml_start - text.ptr);
-                    if (dsml_snippet_len > 500) dsml_snippet_len = 500;
+                    if (dsml_snippet_len > 2000) dsml_snippet_len = 2000;
                 }
                 /* Also log a snippet of the full text to see what the model output */
-                size_t text_snippet_len = text.len > 300 ? 300 : text.len;
+                size_t text_snippet_len = text.len > 1200 ? 1200 : text.len;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
                            ctx_span,
@@ -15563,6 +15749,136 @@ static void test_dsml_repair_produces_parseable_calls(void) {
     buf_free(&repaired);
 }
 
+/* The model drifts between DSML tag spellings: clients such as pi teach plain
+ * <invoke>/<parameter> in their tool schemas while the protocol uses the
+ * " DSML｜"-prefixed tags, and generations mix them, use the singular
+ * <tool_call> spelling, or emit a stray closing tag ahead of the block.  Every
+ * such mix must reduce to one parseable call with a stable (canonical) block. */
+static void test_dsml_flavor_mixing_parses(void) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+
+    /* 1: orphan plain close ahead of the block (the observed failure shape),
+     *    DSML-opened block with plain inner tags and a plain close. */
+    {
+        const char *generated =
+            "</think>\n"
+            "Let me read the file.\n"
+            "</tool_calls>\n"
+            DS4_TOOL_CALLS_START "\n"
+            "<invoke name=\"read\">\n"
+            "<parameter name=\"path\">/etc/hosts</parameter>\n"
+            "</invoke>\n"
+            "</tool_calls>";
+        TEST_ASSERT(parse_generated_message_ex(generated, true, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "read"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/etc/hosts\"") != NULL);
+        /* The orphan close stays in the assistant text, outside the block. */
+        TEST_ASSERT(content && strstr(content, "Let me read the file.") != NULL);
+        TEST_ASSERT(content && strstr(content, "</tool_calls>") != NULL);
+        TEST_ASSERT(calls.raw_tool_text &&
+                    !strncmp(calls.raw_tool_text, "<tool_calls>", strlen("<tool_calls>")));
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* 2: DSML-open/DSML-close with plain inner tags. */
+    {
+        const char *generated =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            "<invoke name=\"bash\">\n"
+            "<parameter name=\"command\" string=\"true\">echo hi</parameter>\n"
+            "</invoke>\n"
+            "</" DS4_DSML "tool_calls>";
+        TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* 3: plain open with a short-flavor close. */
+    {
+        const char *generated =
+            "\n\n<tool_calls>\n"
+            "<invoke name=\"edit\">\n"
+            "<parameter name=\"path\">/tmp/x</parameter>\n"
+            "</invoke>\n"
+            "</" DS4_DSML_SHORT "tool_calls>";
+        TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/x\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* 4: singular <tool_call>/</tool_call> block. */
+    {
+        const char *generated =
+            "\n\n<tool_call>\n"
+            "<invoke name=\"grep\">\n"
+            "<parameter name=\"pattern\">err</parameter>\n"
+            "</invoke>\n"
+            "</tool_call>";
+        TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "grep"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"pattern\": \"err\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* 5: short-flavor whole block. */
+    {
+        const char *generated =
+            "\n\n" DS4_TOOL_CALLS_START_SHORT "\n"
+            "<invoke name=\"bash\">\n"
+            "<parameter name=\"command\" string=\"true\">pwd</parameter>\n"
+            "</invoke>\n"
+            "</" DS4_DSML_SHORT "tool_calls>";
+        TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pwd\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* 6: a parameter value containing literal angle-bracket tool text
+     *    survives the canonicalizing pass byte-for-byte (and still parses). */
+    {
+        const char *generated =
+            "\n\n" DS4_TOOL_CALLS_START "\n"
+            "<invoke name=\"bash\">\n"
+            "<parameter name=\"command\" string=\"true\">echo '<tool_calls>'</parameter>\n"
+            "</invoke>\n"
+            "</tool_calls>";
+        TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(calls.v[0].arguments &&
+                    strstr(calls.v[0].arguments, "echo '<tool_calls>'") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* 7: DSML quoted inside thinking is not treated as the executable block;
+     *    only the post-think block parses, and reasoning keeps its bytes. */
+    {
+        const char *generated =
+            " quoting " DS4_TOOL_CALLS_START " not real</think>\n"
+            DS4_TOOL_CALLS_START "\n"
+            "<invoke name=\"read\">\n"
+            "<parameter name=\"path\">/tmp/real</parameter>\n"
+            "</invoke>\n"
+            "</tool_calls>";
+        TEST_ASSERT(parse_generated_message_ex(generated, true, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "read"));
+        TEST_ASSERT(reasoning && strstr(reasoning, "not real") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+}
+
 static void test_tool_parse_failure_returns_recoverable_finish(void) {
     const char *generated =
         "trying a tool\n\n"
@@ -18362,6 +18678,7 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
+    test_dsml_flavor_mixing_parses();
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
